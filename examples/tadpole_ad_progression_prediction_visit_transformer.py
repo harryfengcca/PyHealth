@@ -99,11 +99,90 @@ Setup: TADPOLE D1/D2 (1,548 sequences after the paper's rules: 1,163 stable,
 385 converter), patient-level folds stratified by sequence type and group,
 15% of the training patients held out for early stopping on validation BCA,
 batch size 32, Adam lr 1e-4, weight decay 1e-5, up to 200 epochs with
-patience 20, seed 42. Values are mean +- std over folds.
+patience 20, seed 42, one GH200 GPU (20-50 s per training run). Tables show
+the mean over folds; standard deviations are in ``summary.csv``.
+"Conv." is the converter subset; "T4 AUROC" is converter detection.
 
-TODO(results): after the real-data runs, replace this paragraph with the
-three tables from ``summary.md`` (reproduce, task_ablation,
-model_ablation), each followed by two or three sentences of findings.
+Reproduction (10 folds). Paper rows are from its Tables 2-5::
+
+    Model                     mAUC    F1   Acc   BCA  Stable  Conv.  Conv.  T4
+                                                       Acc    Acc    BCA  AUROC
+    Raw, VisitTransformer     .957  .836  .840  .884  .920   .598   .559  .862
+    Raw, LSTM (PyHealth)      .943  .826  .833  .879  .906   .611   .563  .835
+    Raw, GRU (PyHealth)       .944  .832  .835  .881  .921   .577   .550  .840
+    Raw, Transformer (paper)  .920  .824  .824  .874  .883   .648   .648    -
+    Raw, LSTM (paper)         .857  .786  .789  .829  .973   .217   .476    -
+    Raw, GRU (paper)          .846  .786  .792  .830  .984   .184   .464    -
+    Bal., VisitTransformer    .917  .801  .812  .844  .838   .787   .657  .853
+    Bal., LSTM (PyHealth)     .885  .779  .794  .831  .814   .774   .647  .828
+    Bal., GRU (PyHealth)      .896  .787  .796  .821  .782   .810   .685  .844
+    Bal., Transformer (paper) .883  .746  .802  .839  .814   .792   .713    -
+    Bal., LSTM (paper)        .857  .786  .684  .770  .926   .439   .566    -
+    Bal., GRU (paper)         .846  .786  .648  .758  .974   .323   .512    -
+
+Findings. (1) VisitTransformer reaches the paper's overall numbers (raw BCA
+.884 vs .874, mAUC .957 vs .920) and its balanced converter accuracy (.787
+vs .792); on the raw data its converter accuracy is lower (.598 vs .648).
+(2) The paper's large converter gap between the Transformer and the RNNs
+(.648 vs at most .217) does not reproduce: PyHealth's LSTM and GRU, trained
+with the same next-visit objective, reach .58-.61 (ablation M1). The gap in
+the paper therefore appears to come from how its RNN baselines were
+trained rather than from recurrence itself. (3) Welch's t-test across the
+10 folds: the Transformer has significantly higher mAUC than LSTM (raw
+p = .019, balanced p = .005) and GRU (raw p = .033), and ranks converters
+better (T4 AUROC .862 vs .835-.840), but its BCA and converter accuracy
+are not significantly different (p > .28); on the balanced data GRU has a
+higher converter BCA (p = .037). (4) The converter sensitivity averaged over
+three classes is lower than the paper's (.270 vs .430): on the raw data our
+Transformer recognizes MCI-to-AD conversions well (sensitivity .739) but
+CN-to-MCI conversions rarely (.072).
+
+Task ablation (5 folds; the same splits for both models)::
+
+                                      LSTM (PyHealth)     VisitTransformer
+    Task configuration               BCA  Conv. T4 AUC   BCA  Conv. T4 AUC
+                                          Acc                 Acc
+    T0  paper task (default)         .884  .603  .826    .890  .592  .858
+    T1a no forward fill              .879  .577  .821    .884  .563  .855
+    T1b ffill + missing indicators   .881  .610  .826    .885  .615  .859
+    T2a no time feature              .875  .564  .825    .882  .581  .853
+    T2b months since prev. visit     .880  .592  .828    .889  .633  .858
+    T3  keep reverters               .842  .578  .823    .850  .650  .851
+
+Findings. Both models move in the same direction. Forward filling helps
+converters (accuracy -.03 without it); explicit missing-value indicators
+do not improve BCA. Dropping the time feature costs about .01 BCA. Months since
+the previous visit, which does not reveal how far ahead the target visit
+is, performs as well as the paper's months-to-target feature (BCA .889 vs
+.890) and gives the Transformer its best converter accuracy among T0-T2
+(.633). Keeping reverters lowers BCA by about .04 for both models: the
+models almost never predict an improving diagnosis (reverter accuracy .07
+for LSTM, .18 for the Transformer). Apart from T3, the differences are at
+most .01 BCA, comparable to the fold-to-fold standard deviation
+(.003-.011).
+
+Model ablation (5 folds, VisitTransformer, task T0)::
+
+    Configuration                 Params   BCA  Stable  Conv.  Conv.   T4
+                                                 Acc    Acc    Sens  AUROC
+    M0  encoder, d128, CE (def.)   0.81M  .890   .932   .592   .272   .858
+    M2a class-weighted CE          0.81M  .887   .923   .600   .272   .852
+    M2b focal loss                 0.81M  .883   .911   .620   .272   .857
+    M3a paper enc.-dec. d256 4+8   8.46M  .888   .929   .589   .264   .864
+    M3b embedding 64               0.34M  .886   .934   .555   .236   .853
+    M3c embedding 256              2.13M  .886   .922   .602   .279   .858
+    M3d 2 encoder layers           0.41M  .885   .918   .602   .269   .861
+    M3e dropout 0.1                0.81M  .885   .926   .587   .301   .859
+    M3f learning rate 1e-3         0.81M  .881   .908   .623   .317   .855
+
+Findings. The model is insensitive to its configuration: every variant is
+within .01 BCA of the default. The paper's encoder-decoder (8.46M
+parameters here; the paper reports 6.6M with an unreported feed-forward
+width) is no better than a 0.81M-parameter encoder on 1.5k sequences.
+Class-weighted and focal losses, and a larger learning rate, trade stable
+accuracy for converter accuracy without improving BCA. T0 and M0 are the
+same configuration and give identical numbers, which confirms that runs
+are deterministic for a given seed and split.
 
 Synthetic smoke test (``--experiment quick``): the pipeline runs end to end
 (data loading -> task -> training -> evaluation) and produces every metric.
