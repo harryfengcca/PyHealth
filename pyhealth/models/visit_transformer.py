@@ -21,9 +21,17 @@ Sequences" (CHIL 2025, https://proceedings.mlr.press/v287/moghaddami25a.html).
 Each clinical visit is one token: a dense vector of measurements, the current
 diagnosis and a time feature. Self-attention lets every visit attend to every
 other visit, so a trend across visits is not filtered through a recurrent
-state. PyHealth's existing :class:`~pyhealth.models.Transformer` embeds
-sequences of medical codes; this model takes dense per-visit vectors and
-offers the paper's two architectures and the losses used in our ablations.
+state.
+
+PyHealth's existing :class:`~pyhealth.models.Transformer` also accepts dense
+``tensor`` inputs, but on visit sequences it has no position encoding (the
+order of visits is invisible to it), infers the padding mask after a biased
+linear projection (so padded visits take part in attention) and represents
+a sequence by its first, i.e. oldest, visit. This model masks padded visits
+out of attention and pooling, adds learned position embeddings, and
+summarizes a sequence by masked mean pooling or, as in the paper, by a
+decoder query. It also offers the class-weighted and focal losses used in
+our ablations.
 
 Shapes use the row-vector convention, ``Y = X @ W``:
 ``[B, T, F] @ [F, d] -> [B, T, d]``, then ``[B, d] @ [d, C] -> [B, C]``.
