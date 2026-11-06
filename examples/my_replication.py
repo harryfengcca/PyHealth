@@ -15,8 +15,9 @@ Description:
     Entry point for the full-pipeline replication (extra credit).
 
 Runs data loading (TADPOLEDataset) -> task processing
-(ADProgressionPrediction) -> model training (VisitTransformer, LSTM, GRU)
--> evaluation, for the reproduction and every ablation.
+(ADProgressionPrediction) -> model training (VisitTransformer, PyHealth's
+LSTM and GRU, and the paper's TST and month-by-month RNN baselines) ->
+evaluation, for the reproduction, the paper's setup and every ablation.
 
 Synthetic data, no ADNI access needed::
 

@@ -93,7 +93,14 @@ Real TADPOLE data on a GPU::
     python examples/tadpole_ad_progression_prediction_visit_transformer.py \\
         --root /path/to/tadpole --experiment reproduce --device cuda
 
-Split folds across jobs with ``--fold k`` and aggregate afterwards with
+Everything at once, one process (reproduce, paper_setup and both
+ablations; also ``python examples/my_replication.py --root ...``)::
+
+    python examples/tadpole_ad_progression_prediction_visit_transformer.py \\
+        --root /path/to/tadpole --experiment all --device cuda
+
+Split folds across jobs with ``--fold k`` (0-9; the ablations have folds
+0-4 and skip higher indices) and aggregate afterwards with
 ``--summarize-only``. Finished runs are skipped on restart.
 
 Outputs, in ``--output-dir/<experiment>/``: ``runs.jsonl`` (one line per
@@ -1621,7 +1628,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         meta = meta_cache[meta_key]
         keep = balanced_patients(meta, args.seed) if cfg.data == "balanced" else None
         splits = plan_folds(meta, n_folds, args.val_ratio, args.seed, keep)
-        folds = [args.fold] if args.fold is not None else range(n_folds)
+        if args.fold is None:
+            folds = range(n_folds)
+        else:
+            # With --experiment all, the ablations have fewer folds than
+            # --fold may name; such configs have nothing to run here.
+            folds = [args.fold] if args.fold < n_folds else []
         for k in folds:
             if (cfg.name, k) in done:
                 logger.info("Skipping %s fold %d (done)", cfg.name, k)
