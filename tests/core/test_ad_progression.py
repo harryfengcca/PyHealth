@@ -228,6 +228,31 @@ class TestADProgressionPrediction(unittest.TestCase):
             ("CN", "reverter", 1),
         )
 
+    def test_raw_sequence(self):
+        seq = self.task.raw_sequence(self.patients["2"])
+        self.assertEqual(seq["diagnoses"], ["MCI", "MCI", "AD"])
+        self.assertEqual((seq["group"], seq["seq_type"]), (2, "converter"))
+        self.assertEqual(len(seq["features"]), 3)  # two inputs and the target
+        self.assertEqual(seq["months"][0], 0.0)
+        self.assertAlmostEqual(seq["months"][1], 6.0, delta=0.1)
+        self.assertAlmostEqual(seq["months"][2], 12.0, delta=0.1)
+        self.assertTrue(math.isnan(seq["features"][1][HIPPO]))  # not filled
+        self.assertIsNone(self.task.raw_sequence(self.patients["3"]))  # reverter
+        self.assertIsNone(self.task.raw_sequence(self.patients["4"]))  # one visit
+
+    def test_imputer_fills_missing_inputs(self):
+        calls = []
+
+        def imputer(pid, rows, months):
+            calls.append((pid, len(rows), len(months)))
+            return [[99.0 if math.isnan(v) else v for v in row] for row in rows]
+
+        task = ADProgressionPrediction(forward_fill=False, imputer=imputer)
+        (sample,) = task(self.patients["1"])
+        self.assertEqual(calls, [("1", 3, 3)])  # input visits only
+        self.assertEqual(sample["visits"][0][HIPPO], 7300.0)  # observed kept
+        self.assertEqual(sample["visits"][2][HIPPO], 99.0)  # missing filled
+
     def test_processed_tensors(self):
         # The task's own schema turns the samples into padded-ready tensors.
         raw = [s for pid in sorted(self.patients) for s in self._raw(pid)]

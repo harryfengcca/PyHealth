@@ -31,12 +31,14 @@ a sequence by its first, i.e. oldest, visit. This model masks padded visits
 out of attention and pooling, adds learned position embeddings, and
 summarizes a sequence by masked mean pooling or, as in the paper, by a
 decoder query. It also offers the class-weighted and focal losses used in
-our ablations.
+our ablations, and the Time Series Transformer (TST) of Zerveas et al.
+(KDD 2021), the paper's second Transformer baseline.
 
 Shapes use the row-vector convention, ``Y = X @ W``:
 ``[B, T, F] @ [F, d] -> [B, T, d]``, then ``[B, d] @ [d, C] -> [B, C]``.
 """
 
+import math
 from typing import Dict, List, Optional, Sequence, Union
 
 import torch
@@ -46,8 +48,60 @@ import torch.nn.functional as F
 from ..datasets import SampleDataset
 from .base_model import BaseModel
 
-ARCHITECTURES = ("encoder", "encoder_decoder")
+ARCHITECTURES = ("encoder", "encoder_decoder", "tst")
 LOSSES = ("ce", "weighted_ce", "focal")
+
+
+def _sinusoidal_positions(length: int, dim: int) -> torch.Tensor:
+    """Fixed sine/cosine position encodings ``[length, dim]``."""
+    position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+    freq = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
+    )
+    table = torch.zeros(length, dim)
+    table[:, 0::2] = torch.sin(position * freq)
+    table[:, 1::2] = torch.cos(position * freq[: dim // 2])
+    return table
+
+
+class _BatchNormEncoderLayer(nn.Module):
+    """TST encoder layer: post-norm residual blocks with batch normalization.
+
+    Follows ``TransformerBatchNormEncoderLayer`` of Zerveas et al. (2021):
+    self-attention and a GELU feed-forward block, each followed by a residual
+    connection and ``BatchNorm1d`` over the embedding channels.
+
+    Args:
+        d_model: Embedding width ``d``.
+        nhead: Attention heads.
+        dim_feedforward: Hidden width of the feed-forward block.
+        dropout: Dropout rate.
+    """
+
+    def __init__(
+        self, d_model: int, nhead: int, dim_feedforward: int, dropout: float
+    ) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.BatchNorm1d(d_model)
+        self.norm2 = nn.BatchNorm1d(d_model)
+
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+        """Encodes ``x`` ``[B, T, d]``; ``padding_mask`` ``[B, T]`` marks padding."""
+        attended, _ = self.self_attn(
+            x, x, x, key_padding_mask=padding_mask, need_weights=False
+        )
+        x = x + self.dropout1(attended)
+        x = self.norm1(x.transpose(1, 2)).transpose(1, 2)
+        x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(x)))))
+        return self.norm2(x.transpose(1, 2)).transpose(1, 2)
 
 
 class VisitTransformer(BaseModel):
@@ -57,13 +111,21 @@ class VisitTransformer(BaseModel):
     padded with all-zero rows by the dataloader. Padded visits are masked out
     of attention and pooling.
 
-    Two architectures are available:
+    Three architectures are available:
 
     * ``"encoder"`` (default, the configuration reported in the first
       author's thesis): a Transformer encoder followed by masked mean pooling.
     * ``"encoder_decoder"`` (the configuration reported in the paper): an
       encoder followed by a decoder in which one learned query token attends
       to the encoded visits; the query's output is classified.
+    * ``"tst"``: the Time Series Transformer of Zerveas et al. (KDD 2021),
+      the paper's other Transformer baseline. Inputs are scaled by
+      ``sqrt(d)`` and given fixed sine/cosine positions, the encoder layers
+      use batch normalization and GELU, and the outputs of all
+      ``max_visits`` positions (padding set to zero) are concatenated,
+      ``[B, max_visits * d] @ [max_visits * d, C] -> [B, C]``. Its usual
+      settings are ``embedding_dim=64, num_heads=8, num_layers=3,
+      feedforward_dim=256, dropout=0.1`` with a small ``max_visits``.
 
     Args:
         dataset: The :class:`~pyhealth.datasets.SampleDataset` to train on.
@@ -76,8 +138,9 @@ class VisitTransformer(BaseModel):
         feedforward_dim: Hidden width of each feed-forward block. Default 512.
         dropout: Dropout rate. Default 0.3.
         max_visits: Maximum number of visits; longer inputs keep the most
-            recent ``max_visits`` visits. Default 64.
-        architecture: ``"encoder"`` or ``"encoder_decoder"``.
+            recent ``max_visits`` visits. With ``"tst"`` every input is
+            padded to this length. Default 64.
+        architecture: ``"encoder"``, ``"encoder_decoder"`` or ``"tst"``.
         loss: ``"ce"`` (cross-entropy), ``"weighted_ce"`` (cross-entropy with
             class weights) or ``"focal"`` (focal loss).
         class_weights: Weights per class index for ``"weighted_ce"`` and
@@ -147,22 +210,22 @@ class VisitTransformer(BaseModel):
         self.num_classes = self.get_output_size()
 
         self.input_projection = nn.Linear(self.input_dim, embedding_dim)
-        self.position_embedding = nn.Embedding(max_visits, embedding_dim)
         self.input_dropout = nn.Dropout(dropout)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=feedforward_dim,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
-        )
-        self.encoder_norm = nn.LayerNorm(embedding_dim)
-        if architecture == "encoder_decoder":
-            decoder_layer = nn.TransformerDecoderLayer(
+        if architecture == "tst":
+            self.register_buffer(
+                "fixed_positions", _sinusoidal_positions(max_visits, embedding_dim)
+            )
+            self.tst_layers = nn.ModuleList(
+                _BatchNormEncoderLayer(
+                    embedding_dim, num_heads, feedforward_dim, dropout
+                )
+                for _ in range(num_layers)
+            )
+            self.output_dropout = nn.Dropout(dropout)
+            self.classifier = nn.Linear(max_visits * embedding_dim, self.num_classes)
+        else:
+            self.position_embedding = nn.Embedding(max_visits, embedding_dim)
+            encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embedding_dim,
                 nhead=num_heads,
                 dim_feedforward=feedforward_dim,
@@ -170,13 +233,26 @@ class VisitTransformer(BaseModel):
                 batch_first=True,
                 norm_first=True,
             )
-            self.decoder = nn.TransformerDecoder(
-                decoder_layer, num_layers=num_decoder_layers
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_layers, enable_nested_tensor=False
             )
-            self.query = nn.Parameter(torch.zeros(1, 1, embedding_dim))
-            nn.init.normal_(self.query, std=0.02)
-            self.decoder_norm = nn.LayerNorm(embedding_dim)
-        self.classifier = nn.Linear(embedding_dim, self.num_classes)
+            self.encoder_norm = nn.LayerNorm(embedding_dim)
+            if architecture == "encoder_decoder":
+                decoder_layer = nn.TransformerDecoderLayer(
+                    d_model=embedding_dim,
+                    nhead=num_heads,
+                    dim_feedforward=feedforward_dim,
+                    dropout=dropout,
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.decoder = nn.TransformerDecoder(
+                    decoder_layer, num_layers=num_decoder_layers
+                )
+                self.query = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+                nn.init.normal_(self.query, std=0.02)
+                self.decoder_norm = nn.LayerNorm(embedding_dim)
+            self.classifier = nn.Linear(embedding_dim, self.num_classes)
 
         weights = self._resolve_class_weights(dataset, loss, class_weights)
         self.register_buffer(
@@ -237,10 +313,13 @@ class VisitTransformer(BaseModel):
             x: Visit features ``[B, T, F]``; all-zero rows are padding.
 
         Returns:
-            Sequence embeddings ``[B, d]``.
+            Sequence embeddings ``[B, d]``, or ``[B, max_visits * d]`` for
+            ``"tst"``.
         """
         if x.size(1) > self.max_visits:
             x = x[:, -self.max_visits :]
+        if self.architecture == "tst":
+            return self._encode_tst(x)
         valid = x.abs().sum(dim=-1) != 0
         # A sequence with no visits would make attention return NaN.
         valid[:, 0] = valid[:, 0] | ~valid.any(dim=1)
@@ -256,6 +335,19 @@ class VisitTransformer(BaseModel):
         weights = valid.unsqueeze(-1).to(h.dtype)
         return (h * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
 
+    def _encode_tst(self, x: torch.Tensor) -> torch.Tensor:
+        """TST encoding: pads to ``max_visits`` and concatenates all positions."""
+        if x.size(1) < self.max_visits:
+            x = F.pad(x, (0, 0, 0, self.max_visits - x.size(1)))
+        valid = x.abs().sum(dim=-1) != 0
+        valid[:, 0] = valid[:, 0] | ~valid.any(dim=1)
+        h = self.input_projection(x) * math.sqrt(self.embedding_dim)
+        h = self.input_dropout(h + self.fixed_positions)
+        for layer in self.tst_layers:
+            h = layer(h, ~valid)
+        h = self.output_dropout(F.gelu(h)) * valid.unsqueeze(-1).to(h.dtype)
+        return h.reshape(h.size(0), -1)
+
     def forward(self, **kwargs: Union[torch.Tensor, List]) -> Dict[str, torch.Tensor]:
         """Runs the model on a collated batch.
 
@@ -268,7 +360,7 @@ class VisitTransformer(BaseModel):
         Returns:
             A dict with ``logit`` ``[B, C]`` and ``y_prob`` ``[B, C]``; with
             labels, also ``loss`` (scalar) and ``y_true`` ``[B]``; with
-            ``embed=True``, also ``embed`` ``[B, d]``.
+            ``embed=True``, also ``embed`` (see :meth:`encode`).
         """
         x = kwargs[self.feature_key]
         if isinstance(x, (tuple, list)):

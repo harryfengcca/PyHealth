@@ -22,8 +22,9 @@ plus ablations that are not in the paper.
 Pipeline
 --------
 ``TADPOLEDataset`` (data loading) -> ``ADProgressionPrediction`` (one stable
-or converter sequence per subject) -> ``VisitTransformer`` or PyHealth's
-``RNN`` (LSTM / GRU baselines) -> evaluation with the paper's metrics.
+or converter sequence per subject) -> ``VisitTransformer``, PyHealth's
+``RNN`` (LSTM / GRU) or the paper's month-by-month RNN baselines
+(``tadpole_monthly_rnn.py``) -> evaluation with the paper's metrics.
 
 Every run uses patient-level cross-validation, stratified by sequence type
 and group (number of input visits). Each fold calls
@@ -35,7 +36,14 @@ Experiments (``--experiment``)
 ``reproduce``
     VisitTransformer, LSTM and GRU on the raw and the balanced dataset
     (stable sequences dropped within each group until they match the
-    converters), 10 folds. Compare with the paper's Tables 2-4.
+    converters), 10 folds. LSTM and GRU are PyHealth's ``RNN`` trained with
+    the same next-visit objective as the Transformer.
+``paper_setup`` (10 folds)
+    The paper's own setup, on the same folds: its encoder-decoder
+    Transformer and the TST (Zerveas et al., 2021), both on inputs imputed
+    by "model filling" with a minimalRNN trained on the training patients
+    of the fold; and its minimalRNN, LSTM and GRU baselines trained month by
+    month as in Nguyen et al. Compare with the paper's Tables 2-5.
 ``task_ablation`` (new, not in the paper; 5 folds)
     Varies the task, with the model fixed. Every task configuration is run
     with PyHealth's existing ``RNN`` (LSTM) and with ``VisitTransformer``, so
@@ -50,7 +58,7 @@ Experiments (``--experiment``)
     M3 architecture and hyperparameters: the paper's encoder-decoder
     configuration, embedding size, depth, dropout, learning rate.
 ``all``
-    The three above. ``quick`` runs a two-fold, two-epoch smoke test.
+    The four above. ``quick`` runs a two-fold, two-epoch smoke test.
 
 Every run also reports T4, converter detection: among subjects not yet at
 AD, the score "probability of a more severe stage than now" is ranked
@@ -67,11 +75,11 @@ counted as 0 (this reproduces, e.g., the paper's converter-subset
 sensitivity of 0.430 = (0 + 0.645 + 0.645) / 3), and
 BCA = (sensitivity + specificity) / 2.
 
-LSTM and GRU here are PyHealth's ``RNN`` trained with the same next-visit
-objective as the Transformer, unlike the paper's monthly roll-out RNNs
-(minimalRNN). Comparing them with the paper's RNN rows is ablation M1
-(new, not in the paper): it separates the effect of the training objective
-from the effect of the architecture.
+Ablation M1 (new, not in the paper) compares the two ways of training the
+recurrent baselines on the same folds: next-visit classification
+(``reproduce``) and the paper's month-by-month forecasting
+(``paper_setup``). It separates the effect of the training objective from
+the effect of the architecture.
 
 Usage
 -----
@@ -210,6 +218,16 @@ from pyhealth.models import RNN, BaseModel, VisitTransformer
 from pyhealth.tasks import ADProgressionPrediction
 from pyhealth.tasks.ad_progression import DX_CLASSES
 from pyhealth.trainer import Trainer
+from tadpole_monthly_rnn import (
+    MonthlyConfig,
+    ModelFiller,
+    MonthlyRNN,
+    fit_standardizer,
+    model_fill_table,
+    predict_monthly_rnn,
+    to_monthly,
+    train_monthly_rnn,
+)
 
 logger = logging.getLogger("tadpole_example")
 
@@ -223,6 +241,22 @@ PAPER_ARCH = {
     "num_heads": 4,
     "num_layers": 4,
     "num_decoder_layers": 8,
+}
+# TST with the defaults of Zerveas et al. (2021). Every input is padded to
+# ``max_visits``, which must cover the longest input sequence (12 visits).
+TST_PARAMS = {
+    "architecture": "tst",
+    "embedding_dim": 64,
+    "num_heads": 8,
+    "num_layers": 3,
+    "feedforward_dim": 256,
+    "dropout": 0.1,
+    "max_visits": 16,
+}
+MONTHLY_CELLS = {
+    "minrnn_monthly": "minrnn",
+    "lstm_monthly": "lstm",
+    "gru_monthly": "gru",
 }
 
 
@@ -243,8 +277,8 @@ def experiment_configs(experiment: str) -> List[RunConfig]:
     """Returns the configurations of one experiment.
 
     Args:
-        experiment: ``"reproduce"``, ``"task_ablation"``, ``"model_ablation"``,
-            ``"quick"`` or ``"all"``.
+        experiment: ``"reproduce"``, ``"paper_setup"``, ``"task_ablation"``,
+            ``"model_ablation"``, ``"quick"`` or ``"all"``.
 
     Returns:
         The run configurations, in the order they are run.
@@ -255,6 +289,37 @@ def experiment_configs(experiment: str) -> List[RunConfig]:
         for data in ("raw", "balanced")
         for model in ("visit_transformer", "lstm", "gru")
     ]
+    # The paper's own setup. "Model filling" replaces forward fill: missing
+    # input values are predicted by a minimalRNN trained month by month on
+    # the training patients of the fold. The RNN baselines are trained the
+    # same month-by-month way (Nguyen et al.), not as next-visit classifiers.
+    paper_fill = {"forward_fill": False, "model_fill": True}
+    paper_setup = []
+    for data in ("raw", "balanced"):
+        paper_setup += [
+            RunConfig(
+                f"{data}/paper_transformer",
+                model_params=PAPER_ARCH,
+                task_params=paper_fill,
+                data=data,
+                group="paper_setup",
+            ),
+            RunConfig(
+                f"{data}/tst",
+                model_params=TST_PARAMS,
+                task_params=paper_fill,
+                data=data,
+                group="paper_setup",
+            ),
+        ] + [
+            RunConfig(
+                f"{data}/{cell}_monthly",
+                model=f"{cell}_monthly",
+                data=data,
+                group="paper_setup",
+            )
+            for cell in ("minrnn", "lstm", "gru")
+        ]
     # Task ablation: one row per task variant; only ``task_params`` change.
     # T0 is the paper's task. T1 asks how much forward filling the missing
     # measurements matters (and whether explicit "was missing" flags help).
@@ -312,15 +377,23 @@ def experiment_configs(experiment: str) -> List[RunConfig]:
         RunConfig("raw/visit_transformer", group="quick"),
         RunConfig("raw/lstm", model="lstm", group="quick"),
         RunConfig("balanced/visit_transformer", data="balanced", group="quick"),
+        RunConfig("raw/minrnn_monthly", model="minrnn_monthly", group="quick"),
+        RunConfig(
+            "raw/tst",
+            model_params=TST_PARAMS,
+            task_params={"forward_fill": False, "model_fill": True},
+            group="quick",
+        ),
     ]
     table = {
         "reproduce": reproduce,
+        "paper_setup": paper_setup,
         "task_ablation": task_ablation,
         "model_ablation": model_ablation,
         "quick": quick,
     }
     if experiment == "all":
-        return reproduce + task_ablation + model_ablation
+        return reproduce + paper_setup + task_ablation + model_ablation
     return table[experiment]
 
 
@@ -631,11 +704,117 @@ def predict(
     }
 
 
+class MonthlyContext:
+    """Raw sequences and month-by-month models shared by the runs of a fold.
+
+    One minimalRNN per fold and data set is both the paper's minimalRNN
+    baseline and the model that fills missing values for the Transformer and
+    the TST, so it is trained once and reused.
+
+    Args:
+        dataset: The loaded TADPOLE dataset.
+        args: Command-line arguments (device, seed, ``monthly_epochs``).
+    """
+
+    def __init__(self, dataset: TADPOLEDataset, args: argparse.Namespace) -> None:
+        self.dataset = dataset
+        self.args = args
+        self._raw: Dict[bool, Dict[str, Dict[str, Any]]] = {}
+        self._models: Dict[Tuple[str, str], Tuple[MonthlyRNN, Any, Any, float]] = {}
+
+    def raw(self, drop_reverters: bool = True) -> Dict[str, Dict[str, Any]]:
+        """Patient ID to raw sequence, from ``ADProgressionPrediction``."""
+        if drop_reverters not in self._raw:
+            task = ADProgressionPrediction(drop_reverters=drop_reverters)
+            table = {}
+            for patient in self.dataset.iter_patients():
+                seq = task.raw_sequence(patient)
+                if seq is not None:
+                    table[str(seq["patient_id"])] = seq
+            self._raw[drop_reverters] = table
+        return self._raw[drop_reverters]
+
+    def model(
+        self, cell: str, split: PatientListSplit
+    ) -> Tuple[MonthlyRNN, Any, Any, float]:
+        """Trains (once) a month-by-month RNN on the training patients.
+
+        Returns:
+            The model, the feature mean and standard deviation it was trained
+            with, and its training time in seconds.
+        """
+        key = (cell, split.to_dict()["sha1"])
+        if key not in self._models:
+            raw = self.raw()
+            train_raw = [raw[p] for p in split.train if p in raw]
+            start = time.time()
+            mean, std = fit_standardizer(train_raw)
+            config = MonthlyConfig(cell=cell, epochs=self.args.monthly_epochs)
+            model = train_monthly_rnn(
+                to_monthly(train_raw, mean, std),
+                config,
+                self.args.device,
+                seed=self.args.seed,
+            )
+            self._models[key] = (model, mean, std, time.time() - start)
+        return self._models[key]
+
+    def filler(self, split: PatientListSplit) -> ModelFiller:
+        """Model filling for every patient of the split (paper, Section 2.2)."""
+        model, mean, std, _ = self.model("minrnn", split)
+        raw = self.raw()
+        pids = list(split.train) + list(split.val) + list(split.test)
+        seqs = to_monthly([raw[p] for p in pids if p in raw], mean, std)
+        return ModelFiller(model_fill_table(model, seqs, mean, std, self.args.device))
+
+
+def run_monthly_fold(
+    cfg: RunConfig, split: PatientListSplit, ctx: MonthlyContext
+) -> Dict[str, Any]:
+    """Trains and evaluates one of the paper's month-by-month RNN baselines.
+
+    The model is trained on the training patients for a fixed number of
+    epochs, as in the reference implementation (the validation patients are
+    not used), then rolled forward from each test sequence's input visits to
+    the month of its target visit.
+
+    Args:
+        cfg: The run configuration (``model`` is ``"<cell>_monthly"``).
+        split: The fold's patient split.
+        ctx: Shared raw sequences and trained models.
+
+    Returns:
+        The fold's metrics, training time and split sizes.
+    """
+    model, mean, std, seconds = ctx.model(MONTHLY_CELLS[cfg.model], split)
+    raw = ctx.raw()
+    test_raw = [raw[p] for p in split.test if p in raw]
+    prob = predict_monthly_rnn(model, to_monthly(test_raw, mean, std), ctx.args.device)
+    rank = {c: i for i, c in enumerate(DX_CLASSES)}
+    metrics = evaluate(
+        {
+            "y": np.array([rank[s["diagnoses"][s["group"]]] for s in test_raw]),
+            "prob": prob,
+            "seq_type": np.array([s["seq_type"] for s in test_raw]),
+            "last_dx": np.array(
+                [rank[s["diagnoses"][s["group"] - 1]] for s in test_raw]
+            ),
+        }
+    )
+    metrics["train_seconds"] = round(seconds, 1)
+    metrics["n_params"] = int(sum(p.numel() for p in model.parameters()))
+    metrics["n_train"] = sum(p in raw for p in split.train)
+    metrics["n_val"] = sum(p in raw for p in split.val)
+    metrics["n_test"] = len(test_raw)
+    return metrics
+
+
 def run_fold(
     dataset: TADPOLEDataset,
     cfg: RunConfig,
-    split: Split,
+    split: PatientListSplit,
     args: argparse.Namespace,
+    ctx: Optional[MonthlyContext] = None,
 ) -> Dict[str, Any]:
     """Trains one configuration on one fold and evaluates it.
 
@@ -644,11 +823,19 @@ def run_fold(
         cfg: The run configuration.
         split: The fold's patient split.
         args: Command-line arguments (training settings).
+        ctx: Shared state for the month-by-month models and model filling;
+            created on demand if ``None``.
 
     Returns:
         The fold's metrics, training time and split sizes.
     """
-    task = ADProgressionPrediction(**cfg.task_params)
+    ctx = ctx or MonthlyContext(dataset, args)
+    if cfg.model in MONTHLY_CELLS:
+        return run_monthly_fold(cfg, split, ctx)
+    task_params = dict(cfg.task_params)
+    if task_params.pop("model_fill", False):
+        task_params["imputer"] = ctx.filler(split)
+    task = ADProgressionPrediction(**task_params)
     train_ds, val_ds, test_ds = dataset.set_task(task, split=split)
     torch.manual_seed(args.seed)
     model = build_model(cfg, train_ds)
@@ -747,6 +934,11 @@ KEY_METRICS = [
 ]
 # Metrics compared with Welch's t-test (the paper's significance test).
 TEST_METRICS = ["overall.mauc", "overall.bca", "converter.accuracy", "converter.bca"]
+# Welch's t-tests: each reference model against the models listed with it.
+WELCH_PAIRS = [
+    ("visit_transformer", ["lstm", "gru"]),
+    ("paper_transformer", ["tst", "minrnn_monthly", "lstm_monthly", "gru_monthly"]),
+]
 
 
 def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
@@ -758,7 +950,7 @@ def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
 
     Returns:
         The markdown table, followed by Welch's t-tests of the Transformer
-        against LSTM and GRU when the reproduction runs are present.
+        against the other models of the same experiment (``WELCH_PAIRS``).
     """
     by_name: Dict[str, List[Dict[str, float]]] = {}
     for run in runs:
@@ -789,22 +981,23 @@ def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
         lines.append(f"| {name} | {len(rows)} | " + " | ".join(cells) + " |")
     tests = []
     for data in ("raw", "balanced"):
-        ref = by_name.get(f"{data}/visit_transformer")
-        for other in ("lstm", "gru"):
-            rows = by_name.get(f"{data}/{other}")
-            if not ref or not rows or len(ref) < 2 or len(rows) < 2:
-                continue
-            for key, label in KEY_METRICS:
-                if key not in TEST_METRICS:
+        for ref_name, others in WELCH_PAIRS:
+            ref = by_name.get(f"{data}/{ref_name}")
+            for other in others:
+                rows = by_name.get(f"{data}/{other}")
+                if not ref or not rows or len(ref) < 2 or len(rows) < 2:
                     continue
-                a = [r[key] for r in ref if key in r and not math.isnan(r[key])]
-                b = [r[key] for r in rows if key in r and not math.isnan(r[key])]
-                if len(a) > 1 and len(b) > 1:
-                    t, p = stats.ttest_ind(a, b, equal_var=False)
-                    tests.append(
-                        f"| {data} | Transformer vs {other.upper()} | {label} "
-                        f"| {t:.2f} | {p:.4f} |"
-                    )
+                for key, label in KEY_METRICS:
+                    if key not in TEST_METRICS:
+                        continue
+                    a = [r[key] for r in ref if key in r and not math.isnan(r[key])]
+                    b = [r[key] for r in rows if key in r and not math.isnan(r[key])]
+                    if len(a) > 1 and len(b) > 1:
+                        t, p = stats.ttest_ind(a, b, equal_var=False)
+                        tests.append(
+                            f"| {data} | {ref_name} vs {other} | {label} "
+                            f"| {t:.2f} | {p:.4f} |"
+                        )
     if tests:
         lines += [
             "",
@@ -834,7 +1027,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--experiment",
         default="quick",
-        choices=["quick", "reproduce", "task_ablation", "model_ablation", "all"],
+        choices=[
+            "quick",
+            "reproduce",
+            "paper_setup",
+            "task_ablation",
+            "model_ablation",
+            "all",
+        ],
     )
     parser.add_argument(
         "--only",
@@ -842,7 +1042,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="Run only configs whose name contains one of these strings.",
     )
-    parser.add_argument("--folds", type=int, default=10, help="Folds for 'reproduce'.")
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=10,
+        help="Folds for 'reproduce' and 'paper_setup'.",
+    )
     parser.add_argument(
         "--ablation-folds", type=int, default=5, help="Folds for the ablations."
     )
@@ -859,6 +1064,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument(
+        "--monthly-epochs",
+        type=int,
+        default=100,
+        help="Epochs of the month-by-month RNNs (reference: 100, no early stop).",
+    )
+    parser.add_argument(
         "--device", default=None, help="cuda, cpu or mps. Default: cuda if available."
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -871,6 +1082,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.experiment == "quick":
         args.folds = args.ablation_folds = 2
         args.epochs = min(args.epochs, 2)
+        args.monthly_epochs = min(args.monthly_epochs, 2)
         args.synthetic_patients = min(args.synthetic_patients, 200)
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -904,10 +1116,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         configs = [c for c in configs if any(s in c.name for s in args.only)]
     done = {(r["config"]["name"], r["fold"]) for r in load_runs(runs_path)}
     meta_cache: Dict[str, List[Dict[str, Any]]] = {}
+    ctx = MonthlyContext(dataset, args)
 
     for cfg in configs:
         n_folds = (
-            args.folds if cfg.group in ("reproduce", "quick") else args.ablation_folds
+            args.folds
+            if cfg.group in ("reproduce", "paper_setup", "quick")
+            else args.ablation_folds
         )
         meta_key = json.dumps(
             {"drop_reverters": cfg.task_params.get("drop_reverters", True)}
@@ -923,13 +1138,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 logger.info("Skipping %s fold %d (done)", cfg.name, k)
                 continue
             logger.info("Running %s fold %d/%d", cfg.name, k + 1, n_folds)
-            metrics = run_fold(dataset, cfg, splits[k], args)
+            metrics = run_fold(dataset, cfg, splits[k], args, ctx)
             record = {
                 "config": asdict(cfg),
                 "fold": k,
                 "metrics": metrics,
                 "seed": args.seed,
-                "epochs": args.epochs,
+                "epochs": (
+                    args.monthly_epochs if cfg.model in MONTHLY_CELLS else args.epochs
+                ),
             }
             with open(runs_path, "a") as handle:
                 handle.write(json.dumps(record) + "\n")

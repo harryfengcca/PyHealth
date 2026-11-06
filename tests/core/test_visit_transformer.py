@@ -72,8 +72,8 @@ class TestVisitTransformer(unittest.TestCase):
         self.assertTrue(torch.allclose(out["y_prob"].sum(-1), torch.ones(6), atol=1e-5))
 
     def test_backward_reaches_every_parameter(self):
-        for arch in ("encoder", "encoder_decoder"):
-            model = self._model(architecture=arch, num_decoder_layers=1)
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            model = self._model(architecture=arch, num_decoder_layers=1, max_visits=4)
             model(**self.batch)["loss"].backward()
             for name, param in model.named_parameters():
                 if name == "_dummy_param":  # BaseModel's device marker
@@ -81,13 +81,23 @@ class TestVisitTransformer(unittest.TestCase):
                 self.assertIsNotNone(param.grad, f"{arch}: {name}")
 
     def test_padding_does_not_change_output(self):
-        model = self._model().eval()
         x = torch.randn(1, 2, 5)
         padded = torch.cat([x, torch.zeros(1, 3, 5)], dim=1)
-        with torch.no_grad():
-            self.assertTrue(
-                torch.allclose(model.encode(x), model.encode(padded), atol=1e-5)
-            )
+        for arch in ("encoder", "tst"):
+            model = self._model(architecture=arch, max_visits=8).eval()
+            with torch.no_grad():
+                self.assertTrue(
+                    torch.allclose(model.encode(x), model.encode(padded), atol=1e-5),
+                    arch,
+                )
+
+    def test_tst_output(self):
+        model = self._model(architecture="tst", max_visits=4)
+        out = model(**self.batch, embed=True)
+        self.assertEqual(tuple(out["logit"].shape), (6, 3))
+        self.assertEqual(tuple(out["embed"].shape), (6, 4 * 16))
+        self.assertEqual(model.classifier.in_features, 4 * 16)
+        self.assertTrue(torch.isfinite(out["loss"]))
 
     def test_encoder_decoder_output(self):
         model = self._model(architecture="encoder_decoder", num_decoder_layers=1)

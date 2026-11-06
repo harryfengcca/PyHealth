@@ -36,7 +36,7 @@ diagnosis at its last visit is more severe than at the visit before, and a
 
 import math
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .base_task import BaseTask
 
@@ -70,6 +70,11 @@ FEATURE_COLUMNS: Tuple[str, ...] = (
 DX_CLASSES: Tuple[str, ...] = ("CN", "MCI", "AD")
 
 TIME_FEATURES: Tuple[str, ...] = ("none", "to_target", "since_previous")
+
+#: Signature of an imputer: ``(patient_id, rows, months) -> rows``. ``rows``
+#: are the input visits' raw feature lists (``nan`` where missing) and
+#: ``months`` their times in months since the first input visit.
+Imputer = Callable[[str, List[List[float]], List[float]], List[List[float]]]
 
 _DX_RANK: Dict[str, int] = {dx: rank for rank, dx in enumerate(DX_CLASSES)}
 _DAYS_PER_MONTH = 30.4375
@@ -239,6 +244,12 @@ class ADProgressionPrediction(BaseTask):
             rule). Default ``True``.
         normalize: Z-score features with training statistics. Default
             ``True``.
+        imputer: Optional callable that fills missing feature values of the
+            input visits before forward filling, e.g. the paper's "model
+            filling" with a recurrent model trained on the training split.
+            Called as ``imputer(patient_id, rows, months)`` (see
+            :data:`Imputer`). Its ``repr`` becomes part of the task's cache
+            key, so it should identify the fitted imputer. Default ``None``.
 
     Examples:
         >>> from pyhealth.datasets import TADPOLEDataset
@@ -266,6 +277,7 @@ class ADProgressionPrediction(BaseTask):
         time_feature: str = "to_target",
         drop_reverters: bool = True,
         normalize: bool = True,
+        imputer: Optional[Imputer] = None,
     ) -> None:
         if time_feature not in TIME_FEATURES:
             raise ValueError(
@@ -276,6 +288,7 @@ class ADProgressionPrediction(BaseTask):
         self.time_feature = time_feature
         self.drop_reverters = bool(drop_reverters)
         self.normalize = bool(normalize)
+        self.imputer = imputer
         self.input_schema = {
             "visits": (
                 "tensor",
@@ -295,6 +308,50 @@ class ADProgressionPrediction(BaseTask):
         extra = 0 if self.time_feature == "none" else 1
         return len(FEATURE_COLUMNS) + len(DX_CLASSES) + extra
 
+    def raw_sequence(self, patient: Any) -> Optional[Dict[str, Any]]:
+        """Returns a subject's sequence before any feature processing.
+
+        Used by :meth:`__call__`, and by models that need the raw visits,
+        such as the paper's month-by-month recurrent baselines.
+
+        Args:
+            patient: A :class:`~pyhealth.data.Patient` with ``tadpole``
+                events.
+
+        Returns:
+            ``None`` if the subject is dropped by the preprocessing rules.
+            Otherwise a dict with ``patient_id``; ``months``, the time of
+            each input visit and then of the target visit, in months since
+            the first input visit; ``features``, the matching rows of the 22
+            raw features in :data:`FEATURE_COLUMNS` (``nan`` where missing);
+            ``diagnoses``, the matching diagnoses; ``seq_type``; and
+            ``group``, the number of input visits.
+        """
+        events = sorted(
+            patient.get_events(event_type="tadpole"), key=lambda e: e.timestamp
+        )
+        diagnoses = [map_diagnosis(getattr(e, "dx", None)) for e in events]
+        sequence = build_sequence(diagnoses, drop_reverters=self.drop_reverters)
+        if sequence is None:
+            return None
+        input_idx, target_idx, seq_type = sequence
+        order = input_idx + [target_idx]
+        start = events[input_idx[0]].timestamp
+        return {
+            "patient_id": patient.patient_id,
+            "months": [_months_between(start, events[i].timestamp) for i in order],
+            "features": [
+                [
+                    parse_numeric(getattr(events[i], col, None))
+                    for col in FEATURE_COLUMNS
+                ]
+                for i in order
+            ],
+            "diagnoses": [diagnoses[i] for i in order],
+            "seq_type": seq_type,
+            "group": len(input_idx),
+        }
+
     def __call__(self, patient: Any) -> List[Dict[str, Any]]:
         """Builds the sample of one subject.
 
@@ -306,49 +363,36 @@ class ADProgressionPrediction(BaseTask):
             A list with one sample, or an empty list if the subject is
             dropped by the preprocessing rules.
         """
-        events = sorted(
-            patient.get_events(event_type="tadpole"), key=lambda e: e.timestamp
-        )
-        diagnoses = [map_diagnosis(getattr(e, "dx", None)) for e in events]
-        sequence = build_sequence(diagnoses, drop_reverters=self.drop_reverters)
-        if sequence is None:
+        seq = self.raw_sequence(patient)
+        if seq is None:
             return []
-        input_idx, target_idx, seq_type = sequence
-        inputs = [events[i] for i in input_idx]
-        target_time = events[target_idx].timestamp
-
-        rows = [
-            [parse_numeric(getattr(e, col, None)) for col in FEATURE_COLUMNS]
-            for e in inputs
-        ]
+        n = seq["group"]
+        months = seq["months"]
+        rows = [list(row) for row in seq["features"][:n]]
+        if self.imputer is not None:
+            rows = self.imputer(seq["patient_id"], rows, months[:n])
         if self.forward_fill:
             rows = forward_fill(rows)
 
         visits: List[List[float]] = []
-        for k, (event, row) in enumerate(zip(inputs, rows)):
-            dx = diagnoses[input_idx[k]]
+        for k, row in enumerate(rows):
+            dx = seq["diagnoses"][k]
             onehot = [1.0 if dx == c else 0.0 for c in DX_CLASSES]
             if self.time_feature == "to_target":
-                time = [_months_between(event.timestamp, target_time)]
+                time = [months[n] - months[k]]
             elif self.time_feature == "since_previous":
-                time = [
-                    (
-                        0.0
-                        if k == 0
-                        else _months_between(inputs[k - 1].timestamp, event.timestamp)
-                    )
-                ]
+                time = [0.0 if k == 0 else months[k] - months[k - 1]]
             else:
                 time = []
-            visits.append(row + onehot + time)
+            visits.append(list(row) + onehot + time)
 
         return [
             {
-                "patient_id": patient.patient_id,
+                "patient_id": seq["patient_id"],
                 "visits": visits,
-                "label": diagnoses[target_idx],
-                "seq_type": seq_type,
-                "group": len(inputs),
-                "last_dx": diagnoses[input_idx[-1]],
+                "label": seq["diagnoses"][n],
+                "seq_type": seq["seq_type"],
+                "group": n,
+                "last_dx": seq["diagnoses"][n - 1],
             }
         ]
