@@ -250,3 +250,4 @@ Available Tasks
     Cancer Survival Prediction (TCGA) <tasks/pyhealth.tasks.CancerSurvivalPrediction>
     In-Hospital Survival (MIMIC-IV) <tasks/pyhealth.tasks.InHospitalSurvivalMIMIC4>
     Cancer Mutation Burden (TCGA) <tasks/pyhealth.tasks.CancerMutationBurden>
+    Alzheimer's Disease Progression (TADPOLE) <tasks/pyhealth.tasks.ADProgressionPrediction>

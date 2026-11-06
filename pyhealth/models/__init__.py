@@ -51,6 +51,7 @@ from .tfm_tokenizer import (
 )
 from .torchvision_model import TorchvisionModel
 from .transformer import Transformer, TransformerLayer
+from .visit_transformer import VisitTransformer
 from .transformers_model import TransformersModel
 from .llm_ehr_encoder import LLMEHREncoder as LLMEHREncoder
 from .ehrmamba import EHRMamba, MambaBlock
