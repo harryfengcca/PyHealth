@@ -72,7 +72,7 @@ from .shhs import SHHSDataset
 from .sleepedf import SleepEDFDataset
 from .bmd_hs import BMDHSDataset
 from .support2 import Support2Dataset
-from .tadpole import TADPOLEDataset
+from .tadpole import TADPOLEDataset as TADPOLEDataset
 from .synthea_csv import SyntheaCSVDataset as SyntheaCSVDataset
 from .tcga_prad import TCGAPRADDataset
 from .splitter import (

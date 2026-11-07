@@ -38,9 +38,10 @@ redistributed. The synthetic helpers contain no ADNI data.
 import csv
 import logging
 import os
+from collections.abc import Sequence
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING
 
 import narwhals as nw
 import numpy as np
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 TADPOLE_FILE_NAME = "TADPOLE_D1_D2.csv"
 
 #: The 22 numeric TADPOLE features used by Moghaddami et al. (2025), lowercase.
-TADPOLE_FEATURE_COLUMNS: Tuple[str, ...] = (
+TADPOLE_FEATURE_COLUMNS: tuple[str, ...] = (
     "cdrsb",
     "adas11",
     "adas13",
@@ -81,14 +82,14 @@ TADPOLE_FEATURE_COLUMNS: Tuple[str, ...] = (
 )
 
 #: CSF columns whose out-of-range values are stored as strings like ``"<8"``.
-TADPOLE_CENSORED_COLUMNS: Tuple[str, ...] = (
+TADPOLE_CENSORED_COLUMNS: tuple[str, ...] = (
     "abeta_upennbiomk9_04_19_17",
     "tau_upennbiomk9_04_19_17",
     "ptau_upennbiomk9_04_19_17",
 )
 
 #: Columns that must exist in the source file (compared case-insensitively).
-TADPOLE_REQUIRED_COLUMNS: Tuple[str, ...] = (
+TADPOLE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "rid",
     "examdate",
     "viscode",
@@ -98,7 +99,7 @@ TADPOLE_REQUIRED_COLUMNS: Tuple[str, ...] = (
 ) + TADPOLE_FEATURE_COLUMNS
 
 # Original TADPOLE spelling of each column, used by the synthetic writers.
-_SOURCE_NAMES: Dict[str, str] = {
+_SOURCE_NAMES: dict[str, str] = {
     "rid": "RID",
     "examdate": "EXAMDATE",
     "viscode": "VISCODE",
@@ -128,7 +129,7 @@ _SOURCE_NAMES: Dict[str, str] = {
     "tau_upennbiomk9_04_19_17": "TAU_UPENNBIOMK9_04_19_17",
     "ptau_upennbiomk9_04_19_17": "PTAU_UPENNBIOMK9_04_19_17",
 }
-_HEADER: List[str] = [_SOURCE_NAMES[c] for c in TADPOLE_REQUIRED_COLUMNS]
+_HEADER: list[str] = [_SOURCE_NAMES[c] for c in TADPOLE_REQUIRED_COLUMNS]
 
 
 class TADPOLEDataset(BaseDataset):
@@ -174,9 +175,9 @@ class TADPOLEDataset(BaseDataset):
     def __init__(
         self,
         root: str,
-        dataset_name: Optional[str] = None,
-        config_path: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
+        dataset_name: str | None = None,
+        config_path: str | None = None,
+        cache_dir: str | Path | None = None,
         num_workers: int = 1,
         dev: bool = False,
     ) -> None:
@@ -258,7 +259,7 @@ class TADPOLEDataset(BaseDataset):
         return ADProgressionPrediction()
 
 
-def _write_rows(root: Union[str, Path], rows: Sequence[Dict[str, object]]) -> Path:
+def _write_rows(root: str | Path, rows: Sequence[dict[str, object]]) -> Path:
     """Writes TADPOLE-format rows (lowercase keys) to ``root``."""
     os.makedirs(root, exist_ok=True)
     path = Path(root) / TADPOLE_FILE_NAME
@@ -272,7 +273,7 @@ def _write_rows(root: Union[str, Path], rows: Sequence[Dict[str, object]]) -> Pa
     return path
 
 
-def write_tadpole_fixture(root: Union[str, Path]) -> Path:
+def write_tadpole_fixture(root: str | Path) -> Path:
     """Writes a five-subject synthetic ``TADPOLE_D1_D2.csv`` for unit tests.
 
     The subjects cover every preprocessing rule of the paper:
@@ -289,20 +290,30 @@ def write_tadpole_fixture(root: Union[str, Path]) -> Path:
 
     Returns:
         The path of the written file.
+
+    Examples:
+        >>> import tempfile
+        >>> from pyhealth.datasets import TADPOLEDataset
+        >>> from pyhealth.datasets.tadpole import write_tadpole_fixture
+        >>> with tempfile.TemporaryDirectory() as root:
+        ...     path = write_tadpole_fixture(root)
+        ...     checked = TADPOLEDataset.validate_source(root)
+        >>> path.name, checked == path
+        ('TADPOLE_D1_D2.csv', True)
     """
 
     def visit(
         rid: str,
         day: str,
         viscode: str,
-        dx: Optional[str],
-        mmse: Optional[float],
-        adas13: Optional[float],
-        hippo: Optional[float],
-        csf: Optional[Tuple[str, str, str]] = None,
-    ) -> Dict[str, object]:
+        dx: str | None,
+        mmse: float | None,
+        adas13: float | None,
+        hippo: float | None,
+        csf: tuple[str, str, str] | None = None,
+    ) -> dict[str, object]:
         """Builds one visit row; unspecified features are left missing."""
-        row: Dict[str, object] = {c: None for c in TADPOLE_REQUIRED_COLUMNS}
+        row: dict[str, object] = {c: None for c in TADPOLE_REQUIRED_COLUMNS}
         row.update(
             rid=rid,
             examdate=day,
@@ -349,12 +360,13 @@ def write_tadpole_fixture(root: Union[str, Path]) -> Path:
 
 
 def _clip(value: float, low: float, high: float) -> float:
+    """Limits ``value`` to the range ``[low, high]``."""
     return float(min(max(value, low), high))
 
 
 def _features(
     severity: float, icv: float, rng: np.random.Generator
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Draws one visit's features from a latent severity (0 normal, 2 AD)."""
     s = severity
     noise = rng.normal
@@ -386,7 +398,7 @@ def _features(
     }
 
 
-_MISSING_RATE: Dict[str, float] = {
+_MISSING_RATE: dict[str, float] = {
     **{c: 0.05 for c in TADPOLE_FEATURE_COLUMNS[:10]},
     "moca": 0.35,
     **{c: 0.35 for c in TADPOLE_FEATURE_COLUMNS[10:17]},
@@ -397,7 +409,7 @@ _MISSING_RATE: Dict[str, float] = {
 
 
 def generate_synthetic_tadpole(
-    root: Union[str, Path], num_patients: int = 400, seed: int = 0
+    root: str | Path, num_patients: int = 400, seed: int = 0
 ) -> Path:
     """Writes a synthetic TADPOLE cohort with realistic progression patterns.
 
@@ -414,12 +426,22 @@ def generate_synthetic_tadpole(
 
     Returns:
         The path of the written file.
+
+    Examples:
+        >>> import csv, tempfile
+        >>> from pyhealth.datasets.tadpole import generate_synthetic_tadpole
+        >>> with tempfile.TemporaryDirectory() as root:
+        ...     path = generate_synthetic_tadpole(root, num_patients=5)
+        ...     with open(path, newline="") as handle:
+        ...         subjects = {row["RID"] for row in csv.DictReader(handle)}
+        >>> len(subjects)
+        5
     """
     rng = np.random.default_rng(seed)
     kinds = ["cn", "mci", "ad", "cn_mci", "mci_ad", "reverter", "single"]
     weights = [0.24, 0.24, 0.16, 0.08, 0.18, 0.05, 0.05]
     schedule = [0, 6, 12, 18, 24, 36, 48, 60, 72, 84]
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     for rid in range(1, num_patients + 1):
         kind = kinds[int(rng.choice(len(kinds), p=weights))]
         n_visits = 1 if kind == "single" else int(rng.integers(3, 9))
@@ -447,7 +469,7 @@ def generate_synthetic_tadpole(
             dx_text = {"CN": "NL", "MCI": "MCI", "AD": "Dementia"}[dx]
             if prev_dx is not None and prev_dx != dx_text:
                 dx_text = f"{prev_dx} to {dx_text}"
-            row: Dict[str, object] = dict(_features(max(sev, 0.0), icv, rng))
+            row: dict[str, object] = dict(_features(max(sev, 0.0), icv, rng))
             for col, rate in _MISSING_RATE.items():
                 if rng.random() < (rate * 0.5 if k == 0 else rate):
                     row[col] = None
@@ -458,8 +480,8 @@ def generate_synthetic_tadpole(
             if isinstance(tau, float) and tau < 80:
                 row["tau_upennbiomk9_04_19_17"] = "<80"
             abeta = row["abeta_upennbiomk9_04_19_17"]
-            if isinstance(abeta, float) and abeta > 1700:
-                row["abeta_upennbiomk9_04_19_17"] = ">1700"
+            if isinstance(abeta, float) and abeta < 200:
+                row["abeta_upennbiomk9_04_19_17"] = "<200"
             missing_dx = k > 0 and rng.random() < 0.08
             jitter = int(rng.integers(-10, 11))
             row.update(

@@ -39,11 +39,11 @@ Shapes use the row-vector convention, ``Y = X @ W``:
 """
 
 import math
-from typing import Dict, List, Optional, Sequence, Union
+from collections.abc import Sequence
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ..datasets import SampleDataset
 from .base_model import BaseModel
@@ -164,6 +164,13 @@ class VisitTransformer(BaseModel):
         >>> model = VisitTransformer(dataset, embedding_dim=16, num_heads=2)
         >>> model.input_dim
         2
+        >>> from pyhealth.datasets import get_dataloader
+        >>> batch = next(iter(get_dataloader(dataset, batch_size=2)))
+        >>> output = model(**batch)
+        >>> tuple(output["y_prob"].shape)
+        (2, 2)
+        >>> sorted(output)
+        ['logit', 'loss', 'y_prob', 'y_true']
     """
 
     def __init__(
@@ -178,7 +185,7 @@ class VisitTransformer(BaseModel):
         max_visits: int = 64,
         architecture: str = "encoder",
         loss: str = "ce",
-        class_weights: Optional[Sequence[float]] = None,
+        class_weights: Sequence[float] | None = None,
         focal_gamma: float = 2.0,
     ) -> None:
         super().__init__(dataset=dataset)
@@ -276,8 +283,8 @@ class VisitTransformer(BaseModel):
         self,
         dataset: SampleDataset,
         loss: str,
-        class_weights: Optional[Sequence[float]],
-    ) -> Optional[torch.Tensor]:
+        class_weights: Sequence[float] | None,
+    ) -> torch.Tensor | None:
         """Returns per-class loss weights, or ``None`` for unweighted losses."""
         if class_weights is not None:
             weights = torch.as_tensor(class_weights, dtype=torch.float32)
@@ -296,6 +303,15 @@ class VisitTransformer(BaseModel):
         return counts.sum() / (self.num_classes * counts)
 
     def _compute_loss(self, logits: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Cross-entropy (optionally class-weighted) or focal loss.
+
+        Args:
+            logits: Class scores ``[B, C]``.
+            y_true: Class indices ``[B]``.
+
+        Returns:
+            The mean loss over the batch (a scalar).
+        """
         weight = self.class_weights if self._use_weights else None
         if self.loss_name == "focal":
             log_prob = F.log_softmax(logits, dim=-1)
@@ -348,7 +364,7 @@ class VisitTransformer(BaseModel):
         h = self.output_dropout(F.gelu(h)) * valid.unsqueeze(-1).to(h.dtype)
         return h.reshape(h.size(0), -1)
 
-    def forward(self, **kwargs: Union[torch.Tensor, List]) -> Dict[str, torch.Tensor]:
+    def forward(self, **kwargs: torch.Tensor | list) -> dict[str, torch.Tensor]:
         """Runs the model on a collated batch.
 
         Args:
@@ -369,7 +385,7 @@ class VisitTransformer(BaseModel):
         x = torch.nan_to_num(x, nan=0.0)
         z = self.encode(x)
         logits = self.classifier(z)
-        results: Dict[str, torch.Tensor] = {
+        results: dict[str, torch.Tensor] = {
             "logit": logits,
             "y_prob": self.prepare_y_prob(logits),
         }

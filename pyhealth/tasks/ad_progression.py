@@ -35,13 +35,15 @@ diagnosis at its last visit is more severe than at the visit before, and a
 """
 
 import math
+from collections.abc import Callable, Sequence
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from itertools import pairwise
+from typing import Any, ClassVar
 
 from .base_task import BaseTask
 
 #: The 22 numeric features per visit, in model input order.
-FEATURE_COLUMNS: Tuple[str, ...] = (
+FEATURE_COLUMNS: tuple[str, ...] = (
     "cdrsb",
     "adas11",
     "adas13",
@@ -67,20 +69,21 @@ FEATURE_COLUMNS: Tuple[str, ...] = (
 )
 
 #: Diagnosis classes from least to most severe.
-DX_CLASSES: Tuple[str, ...] = ("CN", "MCI", "AD")
+DX_CLASSES: tuple[str, ...] = ("CN", "MCI", "AD")
 
-TIME_FEATURES: Tuple[str, ...] = ("none", "to_target", "since_previous")
+#: Allowed values of ``ADProgressionPrediction(time_feature=...)``.
+TIME_FEATURES: tuple[str, ...] = ("none", "to_target", "since_previous")
 
 #: Signature of an imputer: ``(patient_id, rows, months) -> rows``. ``rows``
 #: are the input visits' raw feature lists (``nan`` where missing) and
 #: ``months`` their times in months since the first input visit.
-Imputer = Callable[[str, List[List[float]], List[float]], List[List[float]]]
+Imputer = Callable[[str, list[list[float]], list[float]], list[list[float]]]
 
-_DX_RANK: Dict[str, int] = {dx: rank for rank, dx in enumerate(DX_CLASSES)}
+_DX_RANK: dict[str, int] = {dx: rank for rank, dx in enumerate(DX_CLASSES)}
 _DAYS_PER_MONTH = 30.4375
 
 
-def map_diagnosis(raw: Optional[str]) -> Optional[str]:
+def map_diagnosis(raw: str | None) -> str | None:
     """Maps a raw TADPOLE/ADNI diagnosis string to ``CN``, ``MCI`` or ``AD``.
 
     Transition strings such as ``"MCI to Dementia"`` map to the stage after
@@ -145,8 +148,8 @@ def parse_numeric(value: Any) -> float:
 
 
 def build_sequence(
-    diagnoses: Sequence[Optional[str]], drop_reverters: bool = True
-) -> Optional[Tuple[List[int], int, str]]:
+    diagnoses: Sequence[str | None], drop_reverters: bool = True
+) -> tuple[list[int], int, str] | None:
     """Applies the paper's four rules to one subject's visit diagnoses.
 
     Args:
@@ -174,7 +177,7 @@ def build_sequence(
         return None
     observed = [i for i, dx in enumerate(diagnoses) if dx is not None]
     ranks = [_DX_RANK[diagnoses[i]] for i in observed]
-    reverts = any(later < earlier for earlier, later in zip(ranks, ranks[1:]))
+    reverts = any(later < earlier for earlier, later in pairwise(ranks))
     if reverts and drop_reverters:
         return None
     if len(observed) < 2:
@@ -186,7 +189,7 @@ def build_sequence(
     return observed[:-1], observed[-1], "stable"
 
 
-def forward_fill(rows: List[List[float]]) -> List[List[float]]:
+def forward_fill(rows: list[list[float]]) -> list[list[float]]:
     """Carries each feature's last observed value forward in time.
 
     Values never observed before a visit stay ``nan``.
@@ -196,9 +199,14 @@ def forward_fill(rows: List[List[float]]) -> List[List[float]]:
 
     Returns:
         New lists with missing values filled from earlier visits.
+
+    Examples:
+        >>> nan = float("nan")
+        >>> forward_fill([[1.0, nan], [nan, 2.0], [nan, nan]])
+        [[1.0, nan], [1.0, 2.0], [1.0, 2.0]]
     """
-    filled: List[List[float]] = []
-    last: List[float] = [math.nan] * (len(rows[0]) if rows else 0)
+    filled: list[list[float]] = []
+    last: list[float] = [math.nan] * (len(rows[0]) if rows else 0)
     for row in rows:
         new_row = [last[j] if math.isnan(v) else v for j, v in enumerate(row)]
         last = new_row
@@ -207,6 +215,7 @@ def forward_fill(rows: List[List[float]]) -> List[List[float]]:
 
 
 def _months_between(start: datetime, end: datetime) -> float:
+    """Months (of 30.4375 days) from ``start`` to ``end``."""
     return (end - start).total_seconds() / 86400.0 / _DAYS_PER_MONTH
 
 
@@ -262,13 +271,13 @@ class ADProgressionPrediction(BaseTask):
     """
 
     task_name: str = "ADProgressionPrediction"
-    input_schema: Dict[str, Any] = {
+    input_schema: ClassVar[dict[str, Any]] = {
         "visits": (
             "tensor",
             {"normalization": "zscore", "impute_strategy": "zero"},
         )
     }
-    output_schema: Dict[str, Any] = {"label": "multiclass"}
+    output_schema: ClassVar[dict[str, Any]] = {"label": "multiclass"}
 
     def __init__(
         self,
@@ -277,7 +286,7 @@ class ADProgressionPrediction(BaseTask):
         time_feature: str = "to_target",
         drop_reverters: bool = True,
         normalize: bool = True,
-        imputer: Optional[Imputer] = None,
+        imputer: Imputer | None = None,
     ) -> None:
         if time_feature not in TIME_FEATURES:
             raise ValueError(
@@ -308,7 +317,7 @@ class ADProgressionPrediction(BaseTask):
         extra = 0 if self.time_feature == "none" else 1
         return len(FEATURE_COLUMNS) + len(DX_CLASSES) + extra
 
-    def raw_sequence(self, patient: Any) -> Optional[Dict[str, Any]]:
+    def raw_sequence(self, patient: Any) -> dict[str, Any] | None:
         """Returns a subject's sequence before any feature processing.
 
         Used by :meth:`__call__`, and by models that need the raw visits,
@@ -352,7 +361,7 @@ class ADProgressionPrediction(BaseTask):
             "group": len(input_idx),
         }
 
-    def __call__(self, patient: Any) -> List[Dict[str, Any]]:
+    def __call__(self, patient: Any) -> list[dict[str, Any]]:
         """Builds the sample of one subject.
 
         Args:
@@ -374,7 +383,7 @@ class ADProgressionPrediction(BaseTask):
         if self.forward_fill:
             rows = forward_fill(rows)
 
-        visits: List[List[float]] = []
+        visits: list[list[float]] = []
         for k, row in enumerate(rows):
             dx = seq["diagnoses"][k]
             onehot = [1.0 if dx == c else 0.0 for c in DX_CLASSES]

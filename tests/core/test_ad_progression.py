@@ -26,7 +26,6 @@ import math
 import shutil
 import tempfile
 import unittest
-from typing import Dict, Optional
 
 import polars as pl
 import torch
@@ -48,7 +47,7 @@ HIPPO = FEATURE_COLUMNS.index("hippocampus")
 PTAU = FEATURE_COLUMNS.index("ptau_upennbiomk9_04_19_17")
 
 
-def fixture_patients(root: str) -> Dict[str, Patient]:
+def fixture_patients(root: str) -> dict[str, Patient]:
     """Builds the fixture's patients in memory, as TADPOLEDataset would.
 
     Every column is read as a string and missing cells stay null, matching
@@ -75,7 +74,8 @@ def fixture_patients(root: str) -> Dict[str, Patient]:
 class TestRuleFunctions(unittest.TestCase):
     """The paper's preprocessing rules, without a dataset."""
 
-    def test_map_diagnosis(self):
+    def test_map_diagnosis(self) -> None:
+        """Raw TADPOLE diagnosis strings map to CN, MCI, AD or None."""
         cases = {
             "NL": "CN",
             "CN": "CN",
@@ -91,7 +91,8 @@ class TestRuleFunctions(unittest.TestCase):
         for raw, expected in cases.items():
             self.assertEqual(map_diagnosis(raw), expected, raw)
 
-    def test_parse_numeric(self):
+    def test_parse_numeric(self) -> None:
+        """Numbers, censored strings and missing markers parse to floats."""
         self.assertEqual(parse_numeric("27"), 27.0)
         self.assertEqual(parse_numeric("<8"), 8.0)
         self.assertEqual(parse_numeric(">1300"), 1300.0)
@@ -99,26 +100,32 @@ class TestRuleFunctions(unittest.TestCase):
         for missing in (None, "", " ", "abc"):
             self.assertTrue(math.isnan(parse_numeric(missing)))
 
-    def test_stable_sequence(self):
+    def test_stable_sequence(self) -> None:
+        """An unchanged diagnosis gives a stable sequence ending at the last visit."""
         self.assertEqual(build_sequence(["CN", "CN", "CN"]), ([0, 1], 2, "stable"))
 
-    def test_converter_truncated_at_first_conversion(self):
+    def test_converter_truncated_at_first_conversion(self) -> None:
+        """Visits after the first conversion are discarded (rule 3)."""
         self.assertEqual(
             build_sequence(["CN", "CN", "MCI", "MCI", "AD"]), ([0, 1], 2, "converter")
         )
 
-    def test_missing_diagnosis_visits_are_skipped(self):
+    def test_missing_diagnosis_visits_are_skipped(self) -> None:
+        """Visits without a diagnosis are skipped (rule 4)."""
         self.assertEqual(
             build_sequence(["CN", None, "CN", "MCI"]), ([0, 2], 3, "converter")
         )
 
-    def test_single_visit_is_dropped(self):
+    def test_single_visit_is_dropped(self) -> None:
+        """Subjects with one visit are dropped (rule 1)."""
         self.assertIsNone(build_sequence(["MCI"]))
 
-    def test_too_few_diagnosed_visits_is_dropped(self):
+    def test_too_few_diagnosed_visits_is_dropped(self) -> None:
+        """Subjects with fewer than two diagnosed visits are dropped."""
         self.assertIsNone(build_sequence(["MCI", None, None]))
 
-    def test_reverter_dropped_or_kept(self):
+    def test_reverter_dropped_or_kept(self) -> None:
+        """Reverters are dropped (rule 2) unless ``drop_reverters=False``."""
         self.assertIsNone(build_sequence(["MCI", "CN", "CN"]))
         self.assertEqual(
             build_sequence(["MCI", "CN", "CN"], drop_reverters=False),
@@ -127,21 +134,25 @@ class TestRuleFunctions(unittest.TestCase):
         # A reverter anywhere drops the subject, even after a conversion.
         self.assertIsNone(build_sequence(["CN", "MCI", "CN"]))
 
-    def test_forward_fill(self):
+    def test_forward_fill(self) -> None:
+        """Missing values take the last observed value; leading gaps stay nan."""
         nan = math.nan
         filled = forward_fill([[nan, 1.0], [2.0, nan], [nan, nan]])
         self.assertTrue(math.isnan(filled[0][0]))
         self.assertEqual(filled[1], [2.0, 1.0])
         self.assertEqual(filled[2], [2.0, 1.0])
 
-    def test_feature_columns_match_dataset(self):
+    def test_feature_columns_match_dataset(self) -> None:
+        """The task reads the same 22 features the dataset loads."""
         self.assertEqual(FEATURE_COLUMNS, TADPOLE_FEATURE_COLUMNS)
 
-    def test_invalid_time_feature(self):
+    def test_invalid_time_feature(self) -> None:
+        """An unknown time feature is rejected."""
         with self.assertRaises(ValueError):
             ADProgressionPrediction(time_feature="weeks")
 
-    def test_schema_follows_options(self):
+    def test_schema_follows_options(self) -> None:
+        """The input schema and width follow the task options."""
         task = ADProgressionPrediction(missing_indicators=True, normalize=False)
         _, options = task.input_schema["visits"]
         self.assertTrue(options["missing_indicators"])
@@ -152,26 +163,35 @@ class TestRuleFunctions(unittest.TestCase):
 
 
 class TestADProgressionPrediction(unittest.TestCase):
-    """The task on the synthetic five-subject fixture."""
+    """Sample processing, labels, features and edge cases on the fixture.
+
+    Subject 1 is stable, 2 converts MCI to AD, 3 reverts, 4 has one visit and
+    5 converts CN to MCI after a visit without a diagnosis.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Builds the fixture's patients in a temporary folder."""
         cls.tmp = tempfile.mkdtemp()
         cls.patients = fixture_patients(cls.tmp)
         cls.task = ADProgressionPrediction()
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Removes the temporary folder."""
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _raw(self, pid: str, task: Optional[ADProgressionPrediction] = None) -> list:
+    def _raw(self, pid: str, task: ADProgressionPrediction | None = None) -> list[dict]:
+        """Runs ``task`` (the default task if ``None``) on one subject."""
         return (task or self.task)(self.patients[pid])
 
-    def test_dropped_subjects(self):
+    def test_dropped_subjects(self) -> None:
+        """Reverters and single-visit subjects give no sample."""
         self.assertEqual(self._raw("3"), [])  # reverter
         self.assertEqual(self._raw("4"), [])  # single visit
 
-    def test_stable_sample(self):
+    def test_stable_sample(self) -> None:
+        """A stable subject gives a CN label from its first three visits."""
         (sample,) = self._raw("1")
         self.assertEqual(sample["label"], "CN")
         self.assertEqual(sample["seq_type"], "stable")
@@ -180,7 +200,8 @@ class TestADProgressionPrediction(unittest.TestCase):
         self.assertEqual(len(sample["visits"]), 3)
         self.assertEqual(len(sample["visits"][0]), 26)
 
-    def test_converter_samples(self):
+    def test_converter_samples(self) -> None:
+        """Converters are labeled with the stage they convert to."""
         (mci_ad,) = self._raw("2")
         self.assertEqual(
             (mci_ad["label"], mci_ad["seq_type"], mci_ad["group"]),
@@ -194,7 +215,8 @@ class TestADProgressionPrediction(unittest.TestCase):
         )
         self.assertEqual(cn_mci["last_dx"], "CN")
 
-    def test_diagnosis_one_hot_and_time_to_target(self):
+    def test_diagnosis_one_hot_and_time_to_target(self) -> None:
+        """Each visit row ends with the diagnosis one-hot and months to target."""
         (sample,) = self._raw("2")
         first, second = sample["visits"]
         n = len(FEATURE_COLUMNS)
@@ -202,17 +224,20 @@ class TestADProgressionPrediction(unittest.TestCase):
         self.assertAlmostEqual(first[-1], 12.0, delta=0.1)
         self.assertAlmostEqual(second[-1], 6.0, delta=0.1)
 
-    def test_forward_fill_and_missing_values(self):
+    def test_forward_fill_and_missing_values(self) -> None:
+        """Forward fill fills a missing feature; without it the value stays nan."""
         (sample,) = self._raw("1")
         self.assertEqual(sample["visits"][2][HIPPO], 7290.0)  # filled from m06
         (no_fill,) = self._raw("1", ADProgressionPrediction(forward_fill=False))
         self.assertTrue(math.isnan(no_fill["visits"][2][HIPPO]))
 
-    def test_censored_value_parsed(self):
+    def test_censored_value_parsed(self) -> None:
+        """A censored CSF value is used as its bound."""
         (sample,) = self._raw("5")
         self.assertEqual(sample["visits"][0][PTAU], 8.0)
 
-    def test_time_feature_options(self):
+    def test_time_feature_options(self) -> None:
+        """Months since the previous visit, or no time feature at all."""
         (since,) = self._raw(
             "2", ADProgressionPrediction(time_feature="since_previous")
         )
@@ -221,14 +246,16 @@ class TestADProgressionPrediction(unittest.TestCase):
         (none,) = self._raw("2", ADProgressionPrediction(time_feature="none"))
         self.assertEqual(len(none["visits"][0]), 25)
 
-    def test_keep_reverters(self):
+    def test_keep_reverters(self) -> None:
+        """With ``drop_reverters=False`` a reverter gives a sample."""
         (sample,) = self._raw("3", ADProgressionPrediction(drop_reverters=False))
         self.assertEqual(
             (sample["label"], sample["seq_type"], sample["group"]),
             ("CN", "reverter", 1),
         )
 
-    def test_raw_sequence(self):
+    def test_raw_sequence(self) -> None:
+        """``raw_sequence`` returns the unprocessed visits, inputs and target."""
         seq = self.task.raw_sequence(self.patients["2"])
         self.assertEqual(seq["diagnoses"], ["MCI", "MCI", "AD"])
         self.assertEqual((seq["group"], seq["seq_type"]), (2, "converter"))
@@ -240,10 +267,14 @@ class TestADProgressionPrediction(unittest.TestCase):
         self.assertIsNone(self.task.raw_sequence(self.patients["3"]))  # reverter
         self.assertIsNone(self.task.raw_sequence(self.patients["4"]))  # one visit
 
-    def test_imputer_fills_missing_inputs(self):
+    def test_imputer_fills_missing_inputs(self) -> None:
+        """An imputer fills only missing input values and sees only inputs."""
         calls = []
 
-        def imputer(pid, rows, months):
+        def imputer(
+            pid: str, rows: list[list[float]], months: list[float]
+        ) -> list[list[float]]:
+            """Records the call and fills every missing value with 99."""
             calls.append((pid, len(rows), len(months)))
             return [[99.0 if math.isnan(v) else v for v in row] for row in rows]
 
@@ -253,8 +284,8 @@ class TestADProgressionPrediction(unittest.TestCase):
         self.assertEqual(sample["visits"][0][HIPPO], 7300.0)  # observed kept
         self.assertEqual(sample["visits"][2][HIPPO], 99.0)  # missing filled
 
-    def test_processed_tensors(self):
-        # The task's own schema turns the samples into padded-ready tensors.
+    def test_processed_tensors(self) -> None:
+        """The task's schema turns samples into tensors without nan."""
         raw = [s for pid in sorted(self.patients) for s in self._raw(pid)]
         samples = create_sample_dataset(
             samples=raw,
@@ -270,6 +301,19 @@ class TestADProgressionPrediction(unittest.TestCase):
         vocab = samples.output_processors["label"].label_vocab
         self.assertEqual(sorted(vocab), sorted(DX_CLASSES))
         self.assertEqual(int(by_pid["2"]["label"]), vocab["AD"])
+
+    def test_missing_indicators_double_the_width(self) -> None:
+        """Missing-value indicators add one column per input column."""
+        task = ADProgressionPrediction(missing_indicators=True)
+        raw = [s for pid in sorted(self.patients) for s in self._raw(pid, task)]
+        samples = create_sample_dataset(
+            samples=raw,
+            input_schema=task.input_schema,
+            output_schema=task.output_schema,
+        )
+        visits = next(s for s in samples if s["patient_id"] == "1")["visits"]
+        self.assertEqual(tuple(visits.shape), (3, 2 * 26))
+        self.assertFalse(torch.isnan(visits).any())
 
 
 if __name__ == "__main__":

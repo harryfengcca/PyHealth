@@ -249,16 +249,17 @@ import logging
 import math
 import random
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from scipy import stats
 from sklearn.metrics import f1_score, roc_auc_score, roc_curve
+from torch import nn
 
 from pyhealth.datasets import SampleDataset, Split, TADPOLEDataset, get_dataloader
 from pyhealth.datasets.tadpole import generate_synthetic_tadpole
@@ -304,14 +305,14 @@ class RunConfig:
 
     name: str
     model: str = "visit_transformer"
-    model_params: Dict[str, Any] = field(default_factory=dict)
-    task_params: Dict[str, Any] = field(default_factory=dict)
+    model_params: dict[str, Any] = field(default_factory=dict)
+    task_params: dict[str, Any] = field(default_factory=dict)
     data: str = "raw"
-    lr: Optional[float] = None
+    lr: float | None = None
     group: str = ""
 
 
-def experiment_configs(experiment: str) -> List[RunConfig]:
+def experiment_configs(experiment: str) -> list[RunConfig]:
     """Returns the configurations of one experiment.
 
     Args:
@@ -448,11 +449,11 @@ class PatientListSplit(Split):
     balanced dataset) are left out.
     """
 
-    train: Tuple[str, ...]
-    val: Tuple[str, ...]
-    test: Tuple[str, ...]
+    train: tuple[str, ...]
+    val: tuple[str, ...]
+    test: tuple[str, ...]
 
-    def split_indices(self, patient_to_index: Dict[str, List[int]]) -> List[np.ndarray]:
+    def split_indices(self, patient_to_index: dict[str, list[int]]) -> list[np.ndarray]:
         """Maps the three patient lists to sample indices.
 
         Args:
@@ -467,7 +468,7 @@ class PatientListSplit(Split):
             parts.append(np.array(sorted(idx), dtype=np.int64))
         return parts
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         """Returns a short, hashable description used in cache keys."""
         digest = hashlib.sha1(
             json.dumps([self.train, self.val, self.test]).encode()
@@ -476,12 +477,12 @@ class PatientListSplit(Split):
 
 
 def plan_folds(
-    meta: List[Dict[str, Any]],
+    meta: list[dict[str, Any]],
     n_folds: int,
     val_ratio: float,
     seed: int,
-    keep: Optional[Set[str]] = None,
-) -> List[PatientListSplit]:
+    keep: set[str] | None = None,
+) -> list[PatientListSplit]:
     """Assigns patients to folds, stratified by sequence type and group.
 
     Groups above 6 are pooled into one stratum because they are small.
@@ -498,13 +499,13 @@ def plan_folds(
         One :class:`PatientListSplit` per fold.
     """
     rng = random.Random(seed)
-    strata: Dict[str, List[str]] = {}
+    strata: dict[str, list[str]] = {}
     for m in meta:
         if keep is not None and m["pid"] not in keep:
             continue
         key = f"{m['seq_type']}-{min(m['group'], 6)}"
         strata.setdefault(key, []).append(m["pid"])
-    fold_of: Dict[str, int] = {}
+    fold_of: dict[str, int] = {}
     for key in sorted(strata):
         pids = sorted(strata[key])
         rng.shuffle(pids)
@@ -514,12 +515,12 @@ def plan_folds(
     splits = []
     for k in range(n_folds):
         test = sorted(p for p, f in fold_of.items() if f == k)
-        val: List[str] = []
-        train: List[str] = []
+        val: list[str] = []
+        train: list[str] = []
         for key in sorted(strata):
             rest = sorted(p for p in strata[key] if p in fold_of and fold_of[p] != k)
             random.Random(f"{seed}-{k}-{key}").shuffle(rest)
-            n_val = int(round(len(rest) * val_ratio))
+            n_val = round(len(rest) * val_ratio)
             val += rest[:n_val]
             train += rest[n_val:]
         splits.append(
@@ -528,7 +529,7 @@ def plan_folds(
     return splits
 
 
-def balanced_patients(meta: List[Dict[str, Any]], seed: int) -> Set[str]:
+def balanced_patients(meta: list[dict[str, Any]], seed: int) -> set[str]:
     """The paper's balanced dataset: per group, as many stable as converters.
 
     Args:
@@ -539,7 +540,7 @@ def balanced_patients(meta: List[Dict[str, Any]], seed: int) -> Set[str]:
         The patient IDs kept.
     """
     rng = random.Random(seed)
-    keep: Set[str] = set()
+    keep: set[str] = set()
     for group in sorted({m["group"] for m in meta}):
         conv = sorted(
             m["pid"]
@@ -585,7 +586,7 @@ def hand_till_auc(y: np.ndarray, prob: np.ndarray, classes: Sequence[int]) -> fl
     return float(np.mean(pair_aucs))
 
 
-def subset_metrics(y: np.ndarray, prob: np.ndarray) -> Dict[str, float]:
+def subset_metrics(y: np.ndarray, prob: np.ndarray) -> dict[str, float]:
     """The paper's metrics on one subset of the test sequences.
 
     Sensitivity and specificity are computed one-vs-rest for each of the
@@ -602,7 +603,7 @@ def subset_metrics(y: np.ndarray, prob: np.ndarray) -> Dict[str, float]:
         ``f1_weighted``, ``f1_macro`` and per-class ``sens_*`` / ``spec_*``.
     """
     pred = prob.argmax(axis=1)
-    out: Dict[str, float] = {"n": int(len(y))}
+    out: dict[str, float] = {"n": len(y)}
     if len(y) == 0:
         return out
     labels = list(range(len(DX_CLASSES)))
@@ -632,7 +633,7 @@ def subset_metrics(y: np.ndarray, prob: np.ndarray) -> Dict[str, float]:
 
 def converter_detection(
     y: np.ndarray, prob: np.ndarray, last_dx: np.ndarray, seq_type: np.ndarray
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """T4: ranks P(more severe stage than now) against true converters.
 
     Args:
@@ -658,7 +659,7 @@ def converter_detection(
     }
 
 
-def evaluate(pred: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+def evaluate(pred: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
     """Metrics on all, stable-only and converter-only sequences.
 
     Args:
@@ -781,7 +782,7 @@ class MonthlyRNN(nn.Module):
         num_features: Number of continuous features per month.
     """
 
-    def __init__(self, config: MonthlyConfig, num_features: int = NUM_FEATURES):
+    def __init__(self, config: MonthlyConfig, num_features: int = NUM_FEATURES) -> None:
         super().__init__()
         if config.cell not in CELLS:
             raise ValueError(f"cell must be one of {CELLS}, got {config.cell!r}")
@@ -796,7 +797,8 @@ class MonthlyRNN(nn.Module):
         self.hid2category = nn.Linear(h, NUM_CLASSES)
         self.hid2measures = nn.Linear(h, num_features)
 
-    def _initial_state(self, batch: int, device: torch.device) -> List[Any]:
+    def _initial_state(self, batch: int, device: torch.device) -> list[Any]:
+        """Zero hidden states, one per layer (``(h, c)`` pairs for LSTM)."""
         h = self.config.hidden_size
         zeros = [torch.zeros(batch, h, device=device) for _ in self.cells]
         if self.config.cell == "lstm":
@@ -805,7 +807,7 @@ class MonthlyRNN(nn.Module):
 
     def _dropout_masks(
         self, batch: int, device: torch.device
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Masks fixed for a whole sequence; unscaled, as in the reference."""
         i_mask = torch.ones(batch, self.hid2measures.out_features, device=device)
         r_masks = [torch.ones(batch, self.config.hidden_size, device=device)]
@@ -819,9 +821,21 @@ class MonthlyRNN(nn.Module):
         self,
         cat: torch.Tensor,
         val: torch.Tensor,
-        state: List[Any],
-        masks: Tuple[torch.Tensor, List[torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Any]]:
+        state: list[Any],
+        masks: tuple[torch.Tensor, list[torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[Any]]:
+        """Advances one month.
+
+        Args:
+            cat: Diagnosis input ``[B, 3]``.
+            val: Feature input ``[B, F]``.
+            state: Hidden state of every layer.
+            masks: Input and recurrent dropout masks.
+
+        Returns:
+            Next month's diagnosis probabilities ``[B, 3]`` and features
+            ``[B, F]``, and the new hidden state.
+        """
         i_mask, r_masks = masks
         x = torch.cat([cat, val * i_mask], dim=-1)
         new_state = []
@@ -837,7 +851,7 @@ class MonthlyRNN(nn.Module):
 
     def forward(
         self, cat: torch.Tensor, val: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Runs the model month by month.
 
         Args:
@@ -895,7 +909,7 @@ class MonthlySequence:
     seq_type: str
 
 
-def fit_standardizer(raw: Sequence[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+def fit_standardizer(raw: Sequence[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
     """Per-feature mean and standard deviation over every visit of ``raw``.
 
     Args:
@@ -913,8 +927,8 @@ def fit_standardizer(raw: Sequence[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndar
 
 
 def to_monthly(
-    raw: Sequence[Dict[str, Any]], mean: np.ndarray, std: np.ndarray
-) -> List[MonthlySequence]:
+    raw: Sequence[dict[str, Any]], mean: np.ndarray, std: np.ndarray
+) -> list[MonthlySequence]:
     """Rounds visit times to months and standardizes features.
 
     Two visits that round to the same month are kept one month apart.
@@ -931,7 +945,7 @@ def to_monthly(
     for seq in raw:
         months = []
         for m in seq["months"]:
-            r = int(round(m))
+            r = round(m)
             months.append(max(r, months[-1] + 1) if months else 0)
         feats = (np.array(seq["features"], dtype=float) - mean) / std
         out.append(
@@ -949,7 +963,7 @@ def to_monthly(
 
 def _grid(
     seq: MonthlySequence, n_visits: int, length: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Places the first ``n_visits`` visits on a monthly grid of ``length``.
 
     The first month's missing features take the first observed value among
@@ -973,8 +987,8 @@ def _grid(
 
 
 def _batch(
-    grids: List[Tuple[np.ndarray, np.ndarray]], device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    grids: list[tuple[np.ndarray, np.ndarray]], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Stacks grids to ``[T, B, ...]``, padding the end with zeros."""
     length = max(c.shape[0] for c, _ in grids)
     cats = np.zeros((length, len(grids), NUM_CLASSES))
@@ -982,8 +996,10 @@ def _batch(
     for b, (c, v) in enumerate(grids):
         cats[: len(c), b] = c
         vals[: len(v), b] = v
-    as_tensor = lambda a: torch.tensor(a, dtype=torch.float32, device=device)  # noqa
-    return as_tensor(cats), as_tensor(vals)
+    return (
+        torch.tensor(cats, dtype=torch.float32, device=device),
+        torch.tensor(vals, dtype=torch.float32, device=device),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1108,7 +1124,7 @@ def model_fill_table(
     std: np.ndarray,
     device: str,
     batch_size: int = 256,
-) -> Dict[str, List[List[float]]]:
+) -> dict[str, list[list[float]]]:
     """Input-visit features after model filling, in raw units.
 
     Each sequence's input visits are run through the model; a missing value
@@ -1128,7 +1144,7 @@ def model_fill_table(
     """
     dev = torch.device(device)
     model.eval()
-    table: Dict[str, List[List[float]]] = {}
+    table: dict[str, list[list[float]]] = {}
     for start in range(0, len(sequences), batch_size):
         chunk = sequences[start : start + batch_size]
         grids = [_grid(s, s.n_inputs, int(s.months[s.n_inputs - 1]) + 1) for s in chunk]
@@ -1152,7 +1168,7 @@ class ModelFiller:
         table: Patient ID to filled input-visit rows.
     """
 
-    def __init__(self, table: Dict[str, List[List[float]]]) -> None:
+    def __init__(self, table: dict[str, list[list[float]]]) -> None:
         self.table = table
         blob = json.dumps(
             {k: np.round(v, 4).tolist() for k, v in sorted(table.items())}
@@ -1160,8 +1176,8 @@ class ModelFiller:
         self.digest = hashlib.sha1(blob.encode()).hexdigest()[:16]
 
     def __call__(
-        self, patient_id: str, rows: List[List[float]], months: List[float]
-    ) -> List[List[float]]:
+        self, patient_id: str, rows: list[list[float]], months: list[float]
+    ) -> list[list[float]]:
         """Fills ``nan`` entries of ``rows`` for ``patient_id``."""
         filled = self.table.get(str(patient_id))
         if filled is None or len(filled) != len(rows):
@@ -1172,6 +1188,7 @@ class ModelFiller:
         ]
 
     def __repr__(self) -> str:
+        """Identifies the fitted filler (used in PyHealth's task cache key)."""
         return f"ModelFiller({self.digest})"
 
 
@@ -1206,7 +1223,7 @@ def build_model(cfg: RunConfig, dataset: SampleDataset) -> BaseModel:
 
 def predict(
     model: BaseModel, dataset: SampleDataset, batch_size: int
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Runs the model on ``dataset`` and returns labels in DX_CLASSES order.
 
     Args:
@@ -1254,10 +1271,10 @@ class MonthlyContext:
     def __init__(self, dataset: TADPOLEDataset, args: argparse.Namespace) -> None:
         self.dataset = dataset
         self.args = args
-        self._raw: Dict[bool, Dict[str, Dict[str, Any]]] = {}
-        self._models: Dict[Tuple[str, str], Tuple[MonthlyRNN, Any, Any, float]] = {}
+        self._raw: dict[bool, dict[str, dict[str, Any]]] = {}
+        self._models: dict[tuple[str, str], tuple[MonthlyRNN, Any, Any, float]] = {}
 
-    def raw(self, drop_reverters: bool = True) -> Dict[str, Dict[str, Any]]:
+    def raw(self, drop_reverters: bool = True) -> dict[str, dict[str, Any]]:
         """Patient ID to raw sequence, from ``ADProgressionPrediction``."""
         if drop_reverters not in self._raw:
             task = ADProgressionPrediction(drop_reverters=drop_reverters)
@@ -1271,7 +1288,7 @@ class MonthlyContext:
 
     def model(
         self, cell: str, split: PatientListSplit
-    ) -> Tuple[MonthlyRNN, Any, Any, float]:
+    ) -> tuple[MonthlyRNN, Any, Any, float]:
         """Trains (once) a month-by-month RNN on the training patients.
 
         Returns:
@@ -1305,7 +1322,7 @@ class MonthlyContext:
 
 def run_monthly_fold(
     cfg: RunConfig, split: PatientListSplit, ctx: MonthlyContext
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Trains and evaluates one of the paper's month-by-month RNN baselines.
 
     The model is trained on the training patients for a fixed number of
@@ -1349,8 +1366,8 @@ def run_fold(
     cfg: RunConfig,
     split: PatientListSplit,
     args: argparse.Namespace,
-    ctx: Optional[MonthlyContext] = None,
-) -> Dict[str, Any]:
+    ctx: MonthlyContext | None = None,
+) -> dict[str, Any]:
     """Trains one configuration on one fold and evaluates it.
 
     Args:
@@ -1405,8 +1422,8 @@ def run_fold(
 
 
 def sequence_metadata(
-    dataset: TADPOLEDataset, task_params: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+    dataset: TADPOLEDataset, task_params: dict[str, Any]
+) -> list[dict[str, Any]]:
     """Reads patient ID, sequence type and group of every sample.
 
     Args:
@@ -1433,7 +1450,7 @@ def sequence_metadata(
 # --------------------------------------------------------------------------
 
 
-def load_runs(path: Path) -> List[Dict[str, Any]]:
+def load_runs(path: Path) -> list[dict[str, Any]]:
     """Reads finished runs from a ``runs.jsonl`` file (empty if missing)."""
     if not path.exists():
         return []
@@ -1441,7 +1458,7 @@ def load_runs(path: Path) -> List[Dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def flatten(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
+def flatten(metrics: dict[str, Any], prefix: str = "") -> dict[str, float]:
     """Flattens nested metric dicts into ``{"subset.metric": value}``."""
     flat = {}
     for key, value in metrics.items():
@@ -1476,7 +1493,7 @@ WELCH_PAIRS = [
 ]
 
 
-def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
+def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
     """Writes summary.csv and summary.md; returns the markdown.
 
     Args:
@@ -1487,7 +1504,7 @@ def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
         The markdown table, followed by Welch's t-tests of the Transformer
         against the other models of the same experiment (``WELCH_PAIRS``).
     """
-    by_name: Dict[str, List[Dict[str, float]]] = {}
+    by_name: dict[str, list[dict[str, float]]] = {}
     for run in runs:
         by_name.setdefault(run["config"]["name"], []).append(flatten(run["metrics"]))
     keys = sorted({k for rows in by_name.values() for row in rows for k in row})
@@ -1551,7 +1568,7 @@ def summarize(runs: List[Dict[str, Any]], out_dir: Path) -> str:
 # --------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parses command-line arguments; ``quick`` shrinks the run."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
@@ -1624,7 +1641,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Runs the chosen experiment and prints the summary table."""
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -1650,7 +1667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.only:
         configs = [c for c in configs if any(s in c.name for s in args.only)]
     done = {(r["config"]["name"], r["fold"]) for r in load_runs(runs_path)}
-    meta_cache: Dict[str, List[Dict[str, Any]]] = {}
+    meta_cache: dict[str, list[dict[str, Any]]] = {}
     ctx = MonthlyContext(dataset, args)
 
     for cfg in configs:
