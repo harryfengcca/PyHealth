@@ -20,16 +20,19 @@ written to a temporary directory that is removed afterwards; PyHealth's cache
 is kept inside that directory. No ADNI data is used.
 """
 
+import contextlib
 import csv
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
 from pyhealth.data import Event
-from pyhealth.datasets import TADPOLEDataset
+from pyhealth.datasets import TADPOLEDataset, base_dataset
 from pyhealth.datasets.tadpole import (
     TADPOLE_FEATURE_COLUMNS,
     TADPOLE_FILE_NAME,
@@ -40,6 +43,19 @@ from pyhealth.datasets.tadpole import (
 from pyhealth.tasks import ADProgressionPrediction
 
 
+def _thread_cluster() -> contextlib.AbstractContextManager:
+    """Lets PyHealth's one-time event-table build use Dask threads.
+
+    ``BaseDataset`` starts a Dask cluster of worker *processes* outside
+    notebooks; on five subjects their start-up dominates the build (about
+    1.5 s). Threads give the same table in about 0.7 s. Falls back to the
+    normal build if PyHealth no longer has the ``in_notebook`` switch.
+    """
+    if hasattr(base_dataset, "in_notebook"):
+        return mock.patch.object(base_dataset, "in_notebook", return_value=True)
+    return contextlib.nullcontext()
+
+
 def _is_missing(value: object) -> bool:
     """True for the ways a missing CSV cell can come back from the loader."""
     return value is None or str(value).strip() in ("", "nan", "<NA>", "None")
@@ -48,9 +64,8 @@ def _is_missing(value: object) -> bool:
 class TestTADPOLEDataset(unittest.TestCase):
     """Loading and parsing of the five-subject fixture.
 
-    The dataset is built once for the class; building it is the only slow
-    step (about a second, PyHealth's event-table build), and every test below
-    runs in milliseconds.
+    The dataset is built once for the class (under a second, see
+    :func:`_thread_cluster`), and every test below runs in milliseconds.
     """
 
     @classmethod
@@ -59,7 +74,8 @@ class TestTADPOLEDataset(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp()
         cls.csv_path = write_tadpole_fixture(cls.tmp)
         cls.dataset = TADPOLEDataset(root=cls.tmp, cache_dir=Path(cls.tmp) / "cache")
-        _ = cls.dataset.unique_patient_ids  # build the event table once, here
+        with _thread_cluster():
+            _ = cls.dataset.unique_patient_ids  # build the event table once, here
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -182,6 +198,17 @@ class TestTADPOLEDataset(unittest.TestCase):
         for sample in samples.values():
             self.assertEqual(len(sample["visits"]), sample["group"])
             self.assertEqual(len(sample["visits"][0]), task.num_features)
+
+    def test_task_is_fast(self) -> None:
+        """The task processes every fixture subject in well under a second."""
+        task = self.dataset.default_task
+        patients = [
+            self.dataset.get_patient(p) for p in self.dataset.unique_patient_ids
+        ]
+        start = time.perf_counter()
+        for patient in patients:
+            task(patient)
+        self.assertLess(time.perf_counter() - start, 0.5)
 
     def test_set_task_builds_sample_dataset(self) -> None:
         """``set_task`` turns the samples into tensors."""

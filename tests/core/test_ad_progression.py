@@ -185,6 +185,13 @@ class TestADProgressionPrediction(unittest.TestCase):
         """Runs ``task`` (the default task if ``None``) on one subject."""
         return (task or self.task)(self.patients[pid])
 
+    def test_patient_without_visits(self) -> None:
+        """A subject with no TADPOLE events gives no sample and no error."""
+        empty = self.patients["1"].data_source.clear()
+        patient = Patient(patient_id="0", data_source=empty)
+        self.assertEqual(self.task(patient), [])
+        self.assertIsNone(self.task.raw_sequence(patient))
+
     def test_dropped_subjects(self) -> None:
         """Reverters and single-visit subjects give no sample."""
         self.assertEqual(self._raw("3"), [])  # reverter

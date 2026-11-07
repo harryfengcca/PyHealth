@@ -19,6 +19,7 @@ dataset, so no files are written. Models are tiny and seeded, so every test
 runs in milliseconds and gives the same result on every run.
 """
 
+import io
 import unittest
 
 import torch
@@ -102,6 +103,25 @@ class TestVisitTransformer(unittest.TestCase):
             model(**self.batch)["loss"].backward()
             optimizer.step()
         self.assertLess(model(**self.batch)["loss"].item(), first)
+
+    def test_state_dict_round_trip(self) -> None:
+        """Saved weights load into a fresh model and give the same output."""
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            params = {"architecture": arch, "num_decoder_layers": 1, "max_visits": 4}
+            model = self._model(**params).eval()
+            buffer = io.BytesIO()
+            torch.save(model.state_dict(), buffer)
+            buffer.seek(0)
+            torch.manual_seed(1)  # different initial weights
+            restored = VisitTransformer(self.dataset, **{**SMALL, **params}).eval()
+            restored.load_state_dict(torch.load(buffer, weights_only=True))
+            with torch.no_grad():
+                self.assertTrue(
+                    torch.equal(
+                        model(**self.batch)["logit"], restored(**self.batch)["logit"]
+                    ),
+                    arch,
+                )
 
     def test_padding_does_not_change_output(self) -> None:
         """Padded visits do not change a sequence's encoding."""
