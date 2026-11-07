@@ -114,8 +114,10 @@ Setup: TADPOLE D1/D2 (1,548 sequences after the paper's rules: 1,163 stable,
 385 converter), patient-level folds stratified by sequence type and group,
 15% of the training patients held out for early stopping on validation BCA,
 batch size 32, Adam lr 1e-4, weight decay 1e-5, up to 200 epochs with
-patience 20, seed 42, one GH200 GPU (20-50 s per training run). Tables show
-the mean over folds; standard deviations are in ``summary.csv``.
+patience 20, seed 42, one GH200 GPU (20-70 s per training run). The
+month-by-month RNNs use the reference's settings instead (100 epochs,
+batch 128, lr 1.29e-3; 3-8 min per run). Tables show the mean over folds;
+standard deviations are in ``summary.csv``.
 "Conv." is the converter subset; "T4 AUROC" is converter detection.
 
 Reproduction (10 folds). Paper rows are from its Tables 2-5::
@@ -138,19 +140,56 @@ Reproduction (10 folds). Paper rows are from its Tables 2-5::
 Findings. (1) VisitTransformer reaches the paper's overall numbers (raw BCA
 .884 vs .874, mAUC .957 vs .920) and its balanced converter accuracy (.787
 vs .792); on the raw data its converter accuracy is lower (.598 vs .648).
-(2) The paper's large converter gap between the Transformer and the RNNs
-(.648 vs at most .217) does not reproduce: PyHealth's LSTM and GRU, trained
-with the same next-visit objective, reach .58-.61 (ablation M1). The gap in
-the paper therefore appears to come from how its RNN baselines were
-trained rather than from recurrence itself. (3) Welch's t-test across the
-10 folds: the Transformer has significantly higher mAUC than LSTM (raw
-p = .019, balanced p = .005) and GRU (raw p = .033), and ranks converters
-better (T4 AUROC .862 vs .835-.840), but its BCA and converter accuracy
-are not significantly different (p > .28); on the balanced data GRU has a
-higher converter BCA (p = .037). (4) The converter sensitivity averaged over
-three classes is lower than the paper's (.270 vs .430): on the raw data our
-Transformer recognizes MCI-to-AD conversions well (sensitivity .739) but
-CN-to-MCI conversions rarely (.072).
+(2) Trained with the same next-visit objective, PyHealth's LSTM and GRU
+reach the Transformer's converter accuracy (.58-.61 vs .598), unlike the
+paper's RNNs (at most .217); the paper's setup below explains why.
+(3) Welch's t-test across the 10 folds: the Transformer has significantly
+higher mAUC than LSTM (raw p = .019, balanced p = .005) and GRU (raw
+p = .033), and ranks converters better (T4 AUROC .862 vs .835-.840), but
+its BCA and converter accuracy are not significantly different (p > .28);
+on the balanced data GRU has a higher converter BCA (p = .037). (4) The
+converter sensitivity averaged over three classes is lower than the
+paper's (.270 vs .430): on the raw data our Transformer recognizes
+MCI-to-AD conversions well (sensitivity .739) but CN-to-MCI conversions
+rarely (.072).
+
+Paper setup (10 folds, the same splits as above): the paper's
+encoder-decoder Transformer ("paper Transformer") and the TST on
+model-filled inputs, and the month-by-month RNN baselines. Paper rows are
+from its Tables 2-5::
+
+    Model                     mAUC    F1   Acc   BCA  Stable  Conv.  Conv.  T4
+                                                       Acc    Acc    BCA  AUROC
+    Raw, paper Transformer    .957  .830  .835  .881  .920   .577   .547  .859
+    Raw, TST                  .954  .831  .836  .882  .917   .590   .554  .855
+    Raw, minimalRNN monthly   .935  .759  .764  .838  .989   .086   .335  .809
+    Raw, LSTM monthly         .910  .780  .783  .850  .971   .216   .390  .753
+    Raw, GRU monthly          .896  .762  .767  .840  .985   .107   .344  .718
+    Raw, TST (paper)          .938  .812  .814  .866  .856   .694   .662    -
+    Raw, minimalRNN (paper)   .873  .766  .777  .819  .986   .129   .442    -
+    Bal., paper Transformer   .907  .789  .798  .826  .793   .803   .680  .847
+    Bal., TST                 .908  .785  .795  .831  .804   .787   .670  .841
+    Bal., minimalRNN monthly  .880  .579  .579  .742  .952   .206   .386  .830
+    Bal., LSTM monthly        .845  .669  .663  .779  .916   .411   .473  .773
+    Bal., GRU monthly         .839  .611  .605  .754  .971   .242   .399  .801
+    Bal., TST (paper)         .890  .721  .779  .822  .787   .775   .703    -
+    Bal., minimalRNN (paper)  .873  .766  .623  .742  .956   .291   .499    -
+
+Findings. (5) With the paper's training, the paper's comparison
+reproduces closely: the month-by-month RNNs reach converter accuracy
+.086-.216 on the raw data (paper .129-.217) and .206-.411 on the balanced
+data (paper .291-.439), with stable accuracy .97-.99 (paper .97-.99), and
+the Transformer beats every one of them in converter accuracy (p < 1e-4)
+and BCA (p <= .005; Welch's t-test, 10 folds). (6) Ablation M1: on the same
+folds, the same LSTM and GRU trained as next-visit classifiers reach
+converter accuracy .58-.61 (raw) and .77-.81 (balanced) instead of
+.11-.41 (paired t-test, p < 1e-6), and lose their stable-accuracy edge
+(.91-.92 vs .97-.99 on the raw data). The paper's Transformer-RNN gap comes
+from the month-by-month training, which learns to keep the current
+diagnosis (CN-to-MCI sensitivity 0, MCI-to-AD .11-.28 on the raw data),
+not from recurrence itself. (7) The TST and the paper's Transformer do not
+differ significantly on any tested metric (p > .45), whereas the paper
+reports a higher mAUC and converter accuracy for the TST.
 
 Task ablation (5 folds; the same splits for both models)::
 
