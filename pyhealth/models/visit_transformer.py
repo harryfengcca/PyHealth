@@ -109,7 +109,9 @@ class VisitTransformer(BaseModel):
 
     The input feature must be a ``tensor`` of shape ``[T, F]`` per sample,
     padded with all-zero rows by the dataloader. Padded visits are masked out
-    of attention and pooling.
+    of attention and pooling. An optional ``<feature_key>_mask`` boolean
+    tensor ``[B, T]`` marks real visits, including all-zero visits after
+    normalization. Without it, all-zero rows are treated as padding.
 
     Three architectures are available:
 
@@ -205,6 +207,9 @@ class VisitTransformer(BaseModel):
             raise ValueError(f"loss must be one of {LOSSES}")
         if embedding_dim % num_heads != 0:
             raise ValueError("embedding_dim must be divisible by num_heads")
+
+        if max_visits < 1:
+            raise ValueError("max_visits must be positive")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
@@ -322,23 +327,46 @@ class VisitTransformer(BaseModel):
             return focal.mean()
         return self.label_processor.loss(logits, y_true, weight=weight)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def _prepare_visits(
+        self, x: torch.Tensor, mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Selects each patient's latest valid visits, then pads the batch."""
+        if x.ndim != 3 or x.size(0) == 0 or x.size(1) == 0:
+            raise ValueError("Visit features must have nonempty shape [B, T, F]")
+        if mask is None:
+            valid = x.ne(0).any(dim=-1)
+        else:
+            valid = torch.as_tensor(mask, device=x.device, dtype=torch.bool)
+            if valid.shape != x.shape[:2]:
+                raise ValueError("Visit mask must have shape [B, T]")
+        rows = [row[v][-self.max_visits :] for row, v in zip(x, valid)]
+        lengths = torch.tensor([row.size(0) for row in rows], device=x.device)
+        x = nn.utils.rnn.pad_sequence(rows, batch_first=True)
+        if x.size(1) == 0:
+            x = F.pad(x, (0, 0, 0, 1))
+        valid = torch.arange(x.size(1), device=x.device)[None, :] < lengths[:, None]
+        # Keep the existing finite-output fallback for all-padding samples.
+        valid[:, 0] |= lengths == 0
+        return x, valid
+
+    def encode(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Encodes a batch of visit sequences into one vector per sequence.
 
         Args:
-            x: Visit features ``[B, T, F]``; all-zero rows are padding.
+            x: Visit features ``[B, T, F]``.
+            mask: Optional boolean ``[B, T]``; True marks a real visit. Without
+                a mask, all-zero rows are padding. Each patient's last
+                ``max_visits`` real visits are selected before batch padding.
 
         Returns:
             Sequence embeddings ``[B, d]``, or ``[B, max_visits * d]`` for
             ``"tst"``.
         """
-        if x.size(1) > self.max_visits:
-            x = x[:, -self.max_visits :]
+        x, valid = self._prepare_visits(x, mask)
         if self.architecture == "tst":
-            return self._encode_tst(x)
-        valid = x.abs().sum(dim=-1) != 0
-        # A sequence with no visits would make attention return NaN.
-        valid[:, 0] = valid[:, 0] | ~valid.any(dim=1)
+            return self._encode_tst(x, valid)
         positions = torch.arange(x.size(1), device=x.device)
         h = self.input_projection(x) + self.position_embedding(positions)
         h = self.input_dropout(h)
@@ -351,12 +379,12 @@ class VisitTransformer(BaseModel):
         weights = valid.unsqueeze(-1).to(h.dtype)
         return (h * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
 
-    def _encode_tst(self, x: torch.Tensor) -> torch.Tensor:
+    def _encode_tst(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """TST encoding: pads to ``max_visits`` and concatenates all positions."""
         if x.size(1) < self.max_visits:
-            x = F.pad(x, (0, 0, 0, self.max_visits - x.size(1)))
-        valid = x.abs().sum(dim=-1) != 0
-        valid[:, 0] = valid[:, 0] | ~valid.any(dim=1)
+            padding = self.max_visits - x.size(1)
+            x = F.pad(x, (0, 0, 0, padding))
+            valid = F.pad(valid, (0, padding), value=False)
         h = self.input_projection(x) * math.sqrt(self.embedding_dim)
         h = self.input_dropout(h + self.fixed_positions)
         for layer in self.tst_layers:
@@ -370,8 +398,9 @@ class VisitTransformer(BaseModel):
         Args:
             **kwargs: The batch from a PyHealth dataloader. Must contain the
                 input feature ``[B, T, F]``; the label ``[B]`` is used for the
-                loss when present. ``embed=True`` also returns the sequence
-                embeddings.
+                loss when present. Optional ``<feature_key>_mask`` is a boolean
+                ``[B, T]`` tensor marking real visits. ``embed=True`` also
+                returns the sequence embeddings.
 
         Returns:
             A dict with ``logit`` ``[B, C]`` and ``y_prob`` ``[B, C]``; with
@@ -383,7 +412,7 @@ class VisitTransformer(BaseModel):
             x = x[0]
         x = torch.as_tensor(x).to(self.device, dtype=torch.float32)
         x = torch.nan_to_num(x, nan=0.0)
-        z = self.encode(x)
+        z = self.encode(x, mask=kwargs.get(f"{self.feature_key}_mask"))
         logits = self.classifier(z)
         results: dict[str, torch.Tensor] = {
             "logit": logits,

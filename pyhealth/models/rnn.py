@@ -150,6 +150,11 @@ class RNNLayer(nn.Module):
 class RNN(BaseModel):
     """Recurrent neural network model.
 
+    Numeric visit tensors can supply ``<feature_key>_mask`` as a boolean
+    ``[B, T]`` tensor with a valid prefix followed by padding. This preserves
+    real all-zero visits. Without an explicit mask, ``tensor`` visit inputs
+    use all-zero rows as padding, determined before the embedding projection.
+
     This model applies a separate RNN layer for each feature, and then concatenates
     the final hidden states of each RNN layer. The concatenated hidden states are
     then fed into a fully connected layer to make predictions.
@@ -287,6 +292,19 @@ class RNN(BaseModel):
                 raise ValueError(f"Feature '{feature_key}' must contain 'value' in the schema.")
             
             inputs[feature_key] = value
+            if mask is None and f"{feature_key}_mask" in kwargs:
+                mask = torch.as_tensor(
+                    kwargs[f"{feature_key}_mask"], device=value.device, dtype=torch.bool
+                )
+                if value.dim() != 3 or mask.shape != value.shape[:2]:
+                    raise ValueError("Visit mask must have shape [B, T]")
+                if ((~mask[:, :-1]) & mask[:, 1:]).any():
+                    raise ValueError("RNN visit masks must be right-padded")
+            if mask is None and value.dim() == 3 and isinstance(
+                self.dataset.input_processors[feature_key], TensorProcessor
+            ):
+                # A biased projection maps zero padding to a nonzero vector.
+                mask = value.ne(0).any(dim=-1)
             if mask is not None:
                 masks[feature_key] = mask
 

@@ -31,7 +31,7 @@ import polars as pl
 import torch
 
 from pyhealth.data import Patient
-from pyhealth.datasets import create_sample_dataset
+from pyhealth.datasets import create_sample_dataset, get_dataloader
 from pyhealth.datasets.tadpole import TADPOLE_FEATURE_COLUMNS, write_tadpole_fixture
 from pyhealth.tasks import ADProgressionPrediction
 from pyhealth.tasks.ad_progression import (
@@ -206,6 +206,23 @@ class TestADProgressionPrediction(unittest.TestCase):
         self.assertEqual(sample["last_dx"], "CN")
         self.assertEqual(len(sample["visits"]), 3)
         self.assertEqual(len(sample["visits"][0]), 26)
+
+    def test_visit_masks_survive_processing_and_padding(self) -> None:
+        """Visit validity is preserved through processing and batch padding."""
+        raw = [s for pid in sorted(self.patients) for s in self._raw(pid)]
+        lengths = {s["patient_id"]: len(s["visits"]) for s in raw}
+        samples = create_sample_dataset(
+            samples=raw,
+            input_schema=self.task.input_schema,
+            output_schema=self.task.output_schema,
+        )
+        batch = next(iter(get_dataloader(samples, batch_size=3)))
+        self.assertEqual(batch["visits_mask"].dtype, torch.bool)
+        self.assertEqual(batch["visits_mask"].shape, batch["visits"].shape[:2])
+        for i, pid in enumerate(batch["patient_id"]):
+            n = lengths[pid]
+            self.assertTrue(batch["visits_mask"][i, :n].all())
+            self.assertFalse(batch["visits_mask"][i, n:].any())
 
     def test_converter_samples(self) -> None:
         """Converters are labeled with the stage they convert to."""

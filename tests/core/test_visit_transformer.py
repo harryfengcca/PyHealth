@@ -246,6 +246,76 @@ class TestVisitTransformer(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._model(class_weights=[1.0, 2.0])
 
+    def test_truncation_ignores_other_patients_padding(self) -> None:
+        """Each patient retains its own latest real visits in a mixed batch."""
+        torch.manual_seed(7)
+        short = torch.randn(1, 2, 5)
+        long = torch.randn(1, 6, 5)
+        batch = torch.cat([torch.nn.functional.pad(short, (0, 0, 0, 4)), long])
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            for limit in (1, 4):
+                with self.subTest(architecture=arch, max_visits=limit):
+                    model = self._model(
+                        architecture=arch, num_decoder_layers=1, max_visits=limit
+                    ).eval()
+                    with torch.no_grad():
+                        actual = model.encode(batch)
+                        expected = torch.cat([
+                            model.encode(short[:, -limit:]),
+                            model.encode(long[:, -limit:]),
+                        ])
+                    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_explicit_mask_preserves_zero_visits(self) -> None:
+        """Explicit validity retains real zero rows and ignores masked garbage."""
+        x = torch.tensor([[[1., 2., 3., 4., 5.], [0., 0., 0., 0., 0.]]])
+        padded = torch.cat([x, torch.full((1, 3, 5), 99.)], dim=1)
+        mask = torch.tensor([[True, True, False, False, False]])
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=1
+                ).eval()
+                with torch.no_grad():
+                    actual = model(visits=padded, visits_mask=mask)["logit"]
+                    expected = model(
+                        visits=x[:, -1:], visits_mask=torch.ones(1, 1, dtype=torch.bool)
+                    )["logit"]
+                torch.testing.assert_close(actual, expected)
+
+    def test_truncation_backpropagates_only_through_retained_visits(self) -> None:
+        """Padding and discarded history receive no input gradients."""
+        mask = torch.tensor([[True, True, False, False], [True] * 4])
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=1
+                ).eval()
+                x = torch.randn(2, 4, 5, requires_grad=True)
+                out = model(visits=x, visits_mask=mask, label=torch.tensor([0, 1]))
+                out["loss"].backward()
+                self.assertTrue(torch.isfinite(x.grad).all())
+                self.assertEqual(x.grad[0, 0].abs().sum().item(), 0.)
+                self.assertEqual(x.grad[0, 2:].abs().sum().item(), 0.)
+                self.assertEqual(x.grad[1, :3].abs().sum().item(), 0.)
+                self.assertGreater(x.grad[0, 1].abs().sum().item(), 0.)
+                self.assertGreater(x.grad[1, 3].abs().sum().item(), 0.)
+
+    def test_visit_mask_validation_and_empty_fallback(self) -> None:
+        """Reject malformed masks and keep all-padding samples finite."""
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=4
+                ).eval()
+                with self.assertRaisesRegex(ValueError, "mask must have shape"):
+                    model.encode(torch.zeros(2, 3, 5), mask=torch.ones(2, 2))
+                with torch.no_grad():
+                    out = model(visits=torch.zeros(2, 3, 5))
+                self.assertTrue(torch.isfinite(out["y_prob"]).all())
+        with self.assertRaisesRegex(ValueError, "max_visits must be positive"):
+            self._model(max_visits=0)
+
     def test_long_sequences_are_truncated(self) -> None:
         """Inputs longer than ``max_visits`` keep the most recent visits."""
         model = self._model(max_visits=2).eval()

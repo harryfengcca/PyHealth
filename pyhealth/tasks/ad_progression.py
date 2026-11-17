@@ -40,6 +40,8 @@ from datetime import datetime
 from itertools import pairwise
 from typing import Any, ClassVar
 
+import torch
+
 from .base_task import BaseTask
 
 #: The 22 numeric features per visit, in model input order.
@@ -230,6 +232,9 @@ class ADProgressionPrediction(BaseTask):
       the 22 features in :data:`FEATURE_COLUMNS` (``nan`` where missing),
       the diagnosis one-hot in :data:`DX_CLASSES` order, and an optional time
       feature in months. By default ``F = 26``.
+    * ``visits_mask``: a boolean tensor marking every input visit as real.
+      The dataloader pads it with False, preserving real visits even if all
+      their features become zero after normalization and imputation.
     * ``label``: the diagnosis at the target visit, ``CN``, ``MCI`` or ``AD``.
     * ``seq_type``: ``"stable"``, ``"converter"`` or ``"reverter"``.
     * ``group``: the number of input visits ``n`` (the paper's group).
@@ -298,6 +303,8 @@ class ADProgressionPrediction(BaseTask):
         self.drop_reverters = bool(drop_reverters)
         self.normalize = bool(normalize)
         self.imputer = imputer
+        # Include the sample-layout version in BaseDataset's task cache key.
+        self._visit_mask_version = 1
         self.input_schema = {
             "visits": (
                 "tensor",
@@ -399,6 +406,7 @@ class ADProgressionPrediction(BaseTask):
             {
                 "patient_id": seq["patient_id"],
                 "visits": visits,
+                "visits_mask": torch.ones(len(visits), dtype=torch.bool),
                 "label": seq["diagnoses"][n],
                 "seq_type": seq["seq_type"],
                 "group": n,

@@ -44,6 +44,74 @@ class TestRNN(unittest.TestCase):
 
         self.model = RNN(dataset=self.dataset)
 
+    def test_numeric_padding_before_projection(self):
+        """A biased visit projection must not turn padding into real RNN steps."""
+        samples = [
+            {"patient_id": "short", "visits": [[1., 2.]], "label": "CN"},
+            {"patient_id": "long", "visits": [[2., 3.]] * 4, "label": "AD"},
+        ]
+        dataset = create_sample_dataset(
+            samples, {"visits": "tensor"}, {"label": "multiclass"}
+        )
+        batch = next(iter(get_dataloader(dataset, batch_size=2)))
+        for cell in ("LSTM", "GRU"):
+            with self.subTest(cell=cell):
+                torch.manual_seed(0)
+                model = RNN(
+                    dataset, embedding_dim=8, hidden_dim=8, rnn_type=cell, dropout=0.
+                ).eval()
+                with torch.no_grad():
+                    model.embedding_model.embedding_layers["visits"].bias.fill_(1.)
+                    together = model(**batch)["logit"][0]
+                    alone = model(
+                        visits=batch["visits"][:1, :1], label=batch["label"][:1]
+                    )["logit"][0]
+                torch.testing.assert_close(together, alone)
+
+    def test_numeric_explicit_mask_keeps_zero_visit(self):
+        """A supplied visit mask takes precedence over zero-value inference."""
+        samples = [
+            {"patient_id": "short", "visits": [[1., 2.]], "label": "CN"},
+            {"patient_id": "long", "visits": [[2., 3.]] * 4, "label": "AD"},
+        ]
+        dataset = create_sample_dataset(
+            samples, {"visits": "tensor"}, {"label": "multiclass"}
+        )
+        for cell in ("LSTM", "GRU"):
+            with self.subTest(cell=cell):
+                model = RNN(
+                    dataset, embedding_dim=8, hidden_dim=8, rnn_type=cell, dropout=0.
+                ).eval()
+                x = torch.tensor([[[1., 2.], [0., 0.]]])
+                padded = torch.cat([x, torch.ones(1, 2, 2)], dim=1)
+                label = torch.tensor([0])
+                with torch.no_grad():
+                    expected = model(
+                        visits=x, visits_mask=torch.tensor([[True, True]]), label=label
+                    )["logit"]
+                    actual = model(
+                        visits=padded,
+                        visits_mask=torch.tensor([[True, True, False, False]]),
+                        label=label,
+                    )["logit"]
+                torch.testing.assert_close(actual, expected)
+
+    def test_numeric_visit_mask_validation(self):
+        """Packed RNN inputs require a matching right-padded visit mask."""
+        dataset = create_sample_dataset(
+            [{"patient_id": "p0", "visits": [[1., 2.]], "label": "CN"},
+             {"patient_id": "p1", "visits": [[2., 3.]], "label": "AD"}],
+            {"visits": "tensor"}, {"label": "multiclass"},
+        )
+        model = RNN(dataset, embedding_dim=8, hidden_dim=8)
+        x, label = torch.ones(1, 3, 2), torch.tensor([0])
+        with self.assertRaisesRegex(ValueError, "mask must have shape"):
+            model(visits=x, visits_mask=torch.ones(1, 2), label=label)
+        with self.assertRaisesRegex(ValueError, "must be right-padded"):
+            model(
+                visits=x, visits_mask=torch.tensor([[True, False, True]]), label=label
+            )
+
     def test_model_initialization(self):
         """Test that the RNN model initializes correctly."""
         self.assertIsInstance(self.model, RNN)
