@@ -214,7 +214,7 @@ class VisitTransformer(BaseModel):
         self.loss_name = loss
         self.focal_gamma = focal_gamma
         self.input_dim = self._infer_input_dim(dataset)
-        self.num_classes = self.get_output_size()
+        self.num_classes = self.label_processor.output_size()
 
         self.input_projection = nn.Linear(self.input_dim, embedding_dim)
         self.input_dropout = nn.Dropout(dropout)
@@ -320,7 +320,7 @@ class VisitTransformer(BaseModel):
             if weight is not None:
                 focal = focal * weight[y_true]
             return focal.mean()
-        return F.cross_entropy(logits, y_true, weight=weight)
+        return self.label_processor.loss(logits, y_true, weight=weight)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encodes a batch of visit sequences into one vector per sequence.
@@ -387,7 +387,7 @@ class VisitTransformer(BaseModel):
         logits = self.classifier(z)
         results: dict[str, torch.Tensor] = {
             "logit": logits,
-            "y_prob": self.prepare_y_prob(logits),
+            "y_prob": self.label_processor.activation(logits),
         }
         if self.label_key in kwargs:
             y_true = torch.as_tensor(kwargs[self.label_key]).to(self.device).long()

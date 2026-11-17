@@ -21,11 +21,14 @@ runs in milliseconds and gives the same result on every run.
 
 import io
 import unittest
+from unittest import mock
 
 import torch
 
 from pyhealth.datasets import create_sample_dataset, get_dataloader
 from pyhealth.models import VisitTransformer
+from pyhealth.processors import MultiClassLabelProcessor
+from pyhealth.trainer import Trainer
 
 SMALL = {"embedding_dim": 16, "num_heads": 2, "num_layers": 1, "feedforward_dim": 32}
 
@@ -83,6 +86,82 @@ class TestVisitTransformer(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["loss"]))
         self.assertTrue(torch.allclose(out["y_prob"].sum(-1), torch.ones(6), atol=1e-5))
 
+    def test_label_processor_contract(self) -> None:
+        """Every architecture uses the processor's output size, activation and loss."""
+        processor = self.dataset.output_processors["label"]
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with (
+                self.subTest(architecture=arch),
+                mock.patch.object(
+                    processor, "output_size", wraps=processor.output_size
+                ) as output_size,
+                mock.patch.object(
+                    processor, "activation", wraps=processor.activation
+                ) as activation,
+                mock.patch.object(processor, "loss", wraps=processor.loss) as loss,
+            ):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=4
+                )
+                out = model(**self.batch)
+                output_size.assert_called_once_with()
+                activation.assert_called_once_with(out["logit"])
+                loss.assert_called_once_with(out["logit"], out["y_true"], weight=None)
+                self.assertEqual(model.classifier.out_features, processor.size())
+
+    def test_prediction_without_labels(self) -> None:
+        """All architectures can predict without labels or a loss."""
+        inputs = {"visits": self.batch["visits"]}
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch), torch.no_grad():
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=4
+                ).eval()
+                out = model(**inputs)
+                self.assertEqual(set(out), {"logit", "y_prob"})
+                self.assertEqual(tuple(out["y_prob"].shape), (6, 3))
+                self.assertTrue(torch.isfinite(out["y_prob"]).all())
+                self.assertTrue(
+                    torch.allclose(out["y_prob"].sum(-1), torch.ones(6), atol=1e-5)
+                )
+
+    def test_fixed_vocabulary_includes_unobserved_class(self) -> None:
+        """The processor defines outputs even for classes absent from training."""
+        dataset = create_sample_dataset(
+            samples=[s for s in _samples() if s["label"] != "AD"],
+            input_schema={"visits": "tensor"},
+            output_schema={
+                "label": (MultiClassLabelProcessor, {"labels": ["CN", "MCI", "AD"]})
+            },
+        )
+        model = VisitTransformer(dataset, **SMALL)
+        batch = next(iter(get_dataloader(dataset, batch_size=4)))
+        out = model(**batch)
+        self.assertEqual(model.num_classes, 3)
+        self.assertEqual(tuple(out["y_prob"].shape), (4, 3))
+        self.assertTrue(torch.isfinite(out["loss"]))
+
+    def test_trainer_integration(self) -> None:
+        """The Trainer trains and evaluates every architecture on one tiny batch."""
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=4
+                )
+                before = model.classifier.weight.detach().clone()
+                trainer = Trainer(
+                    model=model,
+                    metrics=["accuracy"],
+                    device="cpu",
+                    enable_logging=False,
+                )
+                loader = get_dataloader(self.dataset, batch_size=6)
+                trainer.train(train_dataloader=loader, epochs=1)
+                self.assertFalse(torch.equal(before, model.classifier.weight))
+                scores = trainer.evaluate(loader)
+                self.assertTrue(torch.isfinite(torch.tensor(scores["loss"])))
+                self.assertTrue(0.0 <= scores["accuracy"] <= 1.0)
+
     def test_backward_reaches_every_parameter(self) -> None:
         """The loss has a gradient for every weight, in every architecture."""
         for arch in ("encoder", "encoder_decoder", "tst"):
@@ -92,6 +171,7 @@ class TestVisitTransformer(unittest.TestCase):
                 if name == "_dummy_param":  # BaseModel's device marker
                     continue
                 self.assertIsNotNone(param.grad, f"{arch}: {name}")
+                self.assertTrue(torch.isfinite(param.grad).all(), f"{arch}: {name}")
 
     def test_training_step_reduces_loss(self) -> None:
         """A few optimizer steps on one batch lower its loss."""
