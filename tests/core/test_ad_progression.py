@@ -26,6 +26,8 @@ import math
 import shutil
 import tempfile
 import unittest
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import polars as pl
 import torch
@@ -41,6 +43,8 @@ from pyhealth.tasks.ad_progression import (
     forward_fill,
     map_diagnosis,
     parse_numeric,
+    prepare_patient_visits,
+    SEQUENCE_POLICY_VERSION,
 )
 
 HIPPO = FEATURE_COLUMNS.index("hippocampus")
@@ -160,6 +164,157 @@ class TestRuleFunctions(unittest.TestCase):
         self.assertEqual(task.output_schema, {"label": "multiclass"})
         self.assertEqual(ADProgressionPrediction().num_features, 26)
         self.assertEqual(ADProgressionPrediction(time_feature="none").num_features, 25)
+
+
+class TestVisitPreparation(unittest.TestCase):
+    """Shared eligibility and duplicate rules on synthetic events only."""
+
+    @staticmethod
+    def _event(month: int, dx: str | None, viscode: str | None = "bl", **values):
+        return SimpleNamespace(
+            timestamp=datetime(2020, 1, 1) + timedelta(days=30 * month),
+            dx=dx, viscode=viscode, **values,
+        )
+
+    @staticmethod
+    def _patient(events):
+        return SimpleNamespace(
+            patient_id="synthetic", get_events=lambda **kwargs: list(events)
+        )
+
+    def test_explicit_reversion_without_observed_decrease(self) -> None:
+        patient = self._patient([
+            self._event(0, "NL"), self._event(6, " MCI  TO  nl ", "m06"),
+            self._event(12, "NL", "m12"),
+        ])
+        prepared = prepare_patient_visits(patient)
+        self.assertEqual(prepared.exclusion_reason, "reverter")
+        self.assertEqual(
+            prepared.diagnostics["additional_explicit_reversion_exclusions"], 1
+        )
+        self.assertEqual(map_diagnosis(" MCI  TO  nl "), "CN")
+        self.assertEqual(ADProgressionPrediction()(patient), [])
+        self.assertIsNotNone(prepare_patient_visits(patient, False).sequence)
+
+    def test_explicit_reversion_after_first_progression(self) -> None:
+        patient = self._patient([
+            self._event(0, "NL"), self._event(6, "MCI", "m06"),
+            self._event(12, "Dementia to MCI", "m12"),
+        ])
+        self.assertEqual(prepare_patient_visits(patient).exclusion_reason, "reverter")
+
+    def test_observed_reversion_without_transition_text(self) -> None:
+        patient = self._patient([self._event(0, "MCI"), self._event(6, "NL", "m06")])
+        prepared = prepare_patient_visits(patient)
+        self.assertEqual(prepared.exclusion_reason, "reverter")
+        self.assertEqual(prepared.diagnostics["explicit_reversion_subjects"], 0)
+        self.assertEqual(prepared.diagnostics["observed_reversion_subjects"], 1)
+
+    def test_identical_rows_collapse_without_changing_label(self) -> None:
+        first = self._event(0, "MCI", mmse=27)
+        target = self._event(6, "Dementia", "m06", mmse=20)
+        task = ADProgressionPrediction(normalize=False)
+        original = task(self._patient([first, target]))[0]
+        for rows in ([first, first, target], [target, first, first]):
+            with self.subTest(order=rows[0].timestamp):
+                patient = self._patient(rows)
+                prepared = prepare_patient_visits(patient)
+                sample = task(patient)[0]
+                self.assertEqual(prepared.diagnostics["collapsed_source_rows"], 1)
+                self.assertEqual(sample["label"], original["label"])
+                self.assertEqual(sample["group"], original["group"])
+                self.assertEqual(len(prepared.source_events), 3)
+
+    def test_complementary_rows_merge_and_do_not_use_target_features(self) -> None:
+        left = self._event(0, None, mmse=27)
+        right = self._event(0, "MCI", hippocampus=6000)
+        target = self._event(6, "Dementia", "m06", mmse=20, hippocampus=5000)
+        for rows in ([left, right, target], [target, right, left]):
+            with self.subTest(first=rows[0].timestamp):
+                patient = self._patient(rows)
+                prepared = prepare_patient_visits(patient)
+                self.assertEqual(prepared.diagnostics["complementary_merge_groups"], 1)
+                seq = ADProgressionPrediction().raw_sequence(patient)
+                self.assertEqual(seq["diagnoses"], ["MCI", "AD"])
+                self.assertEqual(seq["group"], 1)
+                self.assertEqual(seq["features"][0][FEATURE_COLUMNS.index("mmse")], 27)
+                self.assertEqual(seq["features"][0][HIPPO], 6000)
+        self.assertIsNone(left.dx)
+        self.assertFalse(hasattr(left, "hippocampus"))
+
+    def test_merging_preserves_explicit_reversion_information(self) -> None:
+        patient = self._patient([
+            self._event(0, "MCI to NL", mmse=29),
+            self._event(0, "NL", hippocampus=7000),
+            self._event(6, "NL", "m06"),
+        ])
+        prepared = prepare_patient_visits(patient)
+        self.assertEqual(prepared.diagnostics["complementary_merge_groups"], 1)
+        self.assertEqual(prepared.exclusion_reason, "reverter")
+
+    def test_conflicting_diagnoses_or_features_exclude_subject(self) -> None:
+        for other in (self._event(0, "NL", mmse=27),
+                      self._event(0, "MCI", mmse=28)):
+            with self.subTest(diagnosis=other.dx):
+                patient = self._patient([
+                    self._event(0, "MCI", mmse=27), other,
+                    self._event(6, "Dementia", "m06"),
+                ])
+                prepared = prepare_patient_visits(patient)
+                self.assertEqual(
+                    prepared.exclusion_reason, "conflicting_duplicate_visit"
+                )
+                self.assertEqual(ADProgressionPrediction()(patient), [])
+
+    def test_distinct_codes_at_same_timestamp_are_ambiguous(self) -> None:
+        patient = self._patient([
+            self._event(0, "MCI", "bl"), self._event(0, "MCI", "m06"),
+            self._event(12, "Dementia", "m12"),
+        ])
+        prepared = prepare_patient_visits(patient)
+        self.assertEqual(prepared.exclusion_reason, "ambiguous_same_day_visits")
+        self.assertEqual(prepared.diagnostics["collapsed_source_rows"], 0)
+
+    def test_missing_visit_identity_does_not_allow_complementary_merge(self) -> None:
+        patient = self._patient([
+            self._event(0, "MCI", None, mmse=27),
+            self._event(0, "MCI", None, hippocampus=6000),
+            self._event(6, "Dementia", "m06"),
+        ])
+        self.assertEqual(
+            prepare_patient_visits(patient).exclusion_reason,
+            "ambiguous_same_day_visits",
+        )
+
+    def test_duplicate_only_history_has_insufficient_distinct_visits(self) -> None:
+        event = self._event(0, "MCI")
+        prepared = prepare_patient_visits(self._patient([event, event]))
+        self.assertEqual(prepared.exclusion_reason, "fewer_than_two_distinct_visits")
+
+    def test_duplicate_target_is_not_reused_as_an_input_visit(self) -> None:
+        target = self._event(6, "MCI", "m06", mmse=24)
+        patient = self._patient([self._event(0, "MCI", mmse=27), target, target])
+        sequence = ADProgressionPrediction().raw_sequence(patient)
+        self.assertEqual(sequence["group"], 1)
+        self.assertEqual(sequence["features"][0][FEATURE_COLUMNS.index("mmse")], 27)
+        self.assertEqual(sequence["features"][1][FEATURE_COLUMNS.index("mmse")], 24)
+
+    def test_conflict_after_first_conversion_still_excludes_subject(self) -> None:
+        patient = self._patient([
+            self._event(0, "NL"), self._event(6, "MCI", "m06"),
+            self._event(12, "MCI", "m12", mmse=27),
+            self._event(12, "MCI", "m12", mmse=26),
+        ])
+        self.assertEqual(
+            prepare_patient_visits(patient).exclusion_reason,
+            "conflicting_duplicate_visit",
+        )
+
+    def test_task_cache_contains_sequence_policy_version(self) -> None:
+        self.assertEqual(
+            vars(ADProgressionPrediction())["_sequence_policy_version"],
+            SEQUENCE_POLICY_VERSION,
+        )
 
 
 class TestADProgressionPrediction(unittest.TestCase):

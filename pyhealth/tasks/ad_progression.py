@@ -21,6 +21,12 @@ Sequences" (CHIL 2025, https://proceedings.mlr.press/v287/moghaddami25a.html):
 given a subject's first ``n`` visits, predict the clinical diagnosis
 (CN, MCI or AD) at visit ``n + 1``.
 
+Visits first pass through :func:`prepare_patient_visits`: matching visit
+identities are deduplicated or compatibly merged; conflicts and ambiguous
+same-timestamp visits exclude the subject. This duplicate policy is a team
+processing decision. Explicit transition strings and observed stage changes
+are both checked for reversions before first-conversion truncation.
+
 Each subject yields at most one sample, built with the paper's rules:
 
 1. Subjects with a single visit are dropped.
@@ -35,6 +41,9 @@ diagnosis at its last visit is more severe than at the visit before, and a
 """
 
 import math
+import re
+from collections import defaultdict
+from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from itertools import pairwise
@@ -106,19 +115,22 @@ def map_diagnosis(raw: str | None) -> str | None:
         >>> map_diagnosis("") is None
         True
     """
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text or text.lower() in ("nan", "none", "<na>"):
-        return None
-    stage = text.split(" to ")[-1].strip().lower()
-    if stage in ("nl", "cn", "normal"):
-        return "CN"
-    if stage in ("mci", "emci", "lmci"):
-        return "MCI"
-    if stage in ("dementia", "ad"):
-        return "AD"
-    return None
+    return _diagnosis_transition(raw)[1]
+
+
+def _diagnosis_transition(raw: Any) -> tuple[str | None, str | None]:
+    """Preserves both stages of recognized transition strings."""
+    aliases = {
+        "nl": "CN", "cn": "CN", "normal": "CN",
+        "mci": "MCI", "emci": "MCI", "lmci": "MCI",
+        "dementia": "AD", "ad": "AD",
+    }
+    parts = re.split(r"\s+to\s+", str(raw).strip().lower())
+    if len(parts) == 1:
+        return None, aliases.get(parts[0])
+    if len(parts) == 2:
+        return aliases.get(parts[0]), aliases.get(parts[1])
+    return None, None
 
 
 def parse_numeric(value: Any) -> float:
@@ -191,6 +203,147 @@ def build_sequence(
     return observed[:-1], observed[-1], "stable"
 
 
+SEQUENCE_POLICY_VERSION = 2
+
+
+@dataclass
+class _PreparedVisit:
+    """One resolved visit; source rows remain untouched."""
+
+    timestamp: Any
+    dx: str | None
+    features: tuple[float, ...]
+
+
+@dataclass
+class _PreparedPatient:
+    """Shared selection result and aggregate-safe diagnostics."""
+
+    source_events: list[Any]
+    visits: list[_PreparedVisit]
+    sequence: tuple[list[int], int, str] | None
+    exclusion_reason: str | None
+    diagnostics: dict[str, int]
+
+
+def prepare_patient_visits(
+    patient: Any, drop_reverters: bool = True
+) -> _PreparedPatient:
+    """Resolves visits and applies the task's shared sequence policy.
+
+    Exact duplicates in selected fields collapse to one visit. Complementary
+    records merge only when timestamp and nonempty visit code agree and all
+    overlapping selected measurements/diagnoses agree. Different visit codes
+    at the same timestamp, unidentified nonidentical visits, and conflicting
+    records exclude the subject. This conservative duplicate policy is a team
+    decision, not a duplicate-resolution method specified by the paper.
+
+    Explicit reversions are detected from every source row before merging.
+    Both explicit and observed reversions exclude the subject by default,
+    including reversions after a first conversion. With ``drop_reverters=False``
+    those subjects are kept and labels follow observed destination diagnoses.
+
+    Args:
+        patient: Patient exposing timestamped ``tadpole`` events.
+        drop_reverters: Whether to exclude explicit or observed reversions.
+
+    Returns:
+        Resolved visits, selection or exclusion reason, original events, and
+        aggregate diagnostics. No original event is modified. Diagnostic
+        counts can overlap; the audit's visit ledger accounts for rows once.
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> patient = SimpleNamespace(get_events=lambda **kwargs: [])
+        >>> prepare_patient_visits(patient).exclusion_reason
+        'fewer_than_two_total_visits'
+    """
+    source = sorted(patient.get_events(event_type="tadpole"), key=lambda e: e.timestamp)
+    transitions = [_diagnosis_transition(getattr(e, "dx", None)) for e in source]
+    explicit = any(
+        a is not None and b is not None and _DX_RANK[b] < _DX_RANK[a]
+        for a, b in transitions
+    )
+    groups: dict[Any, list[Any]] = defaultdict(list)
+    for event in source:
+        groups[event.timestamp].append(event)
+    diagnostics = {
+        "explicit_reversion_subjects": int(explicit),
+        "observed_reversion_subjects": 0,
+        "additional_explicit_reversion_exclusions": 0,
+        "same_timestamp_groups": 0,
+        "exact_duplicate_groups": 0,
+        "complementary_merge_groups": 0,
+        "collapsed_source_rows": 0,
+        "ambiguous_same_day_groups": 0,
+        "conflicting_duplicate_groups": 0,
+    }
+    visits = []
+    for timestamp, group in groups.items():
+        diagnoses = [map_diagnosis(getattr(e, "dx", None)) for e in group]
+        values = [tuple(parse_numeric(getattr(e, c, None)) for c in FEATURE_COLUMNS)
+                  for e in group]
+        if len(group) == 1:
+            visits.append(_PreparedVisit(timestamp, diagnoses[0], values[0]))
+            continue
+        diagnostics["same_timestamp_groups"] += 1
+        codes = {str(getattr(e, "viscode", "") or "").strip().lower() for e in group}
+        # Distinct codes establish different visit identities, not their order.
+        if len(codes) != 1:
+            diagnostics["ambiguous_same_day_groups"] += 1
+            continue
+        raw_dx = [str(getattr(e, "dx", None)).strip().lower() for e in group]
+        exact = len(set(raw_dx)) == 1 and all(
+            all(a == b or (math.isnan(a) and math.isnan(b))
+                for a, b in zip(values[0], row)) for row in values[1:]
+        )
+        code = next(iter(codes))
+        if code in ("", "nan", "none", "<na>") and not exact:
+            diagnostics["ambiguous_same_day_groups"] += 1
+            continue
+        known_dx = {dx for dx in diagnoses if dx is not None}
+        columns = [{row[j] for row in values if not math.isnan(row[j])}
+                   for j in range(len(FEATURE_COLUMNS))]
+        unknown_dx = any(
+            dx is None and raw not in ("", "nan", "none", "<na>")
+            for dx, raw in zip(diagnoses, raw_dx)
+        )
+        if len(known_dx) > 1 or any(len(c) > 1 for c in columns) or (
+            unknown_dx and not exact
+        ):
+            diagnostics["conflicting_duplicate_groups"] += 1
+            continue
+        merged = tuple(next(iter(c)) if c else math.nan for c in columns)
+        visits.append(_PreparedVisit(timestamp, next(iter(known_dx), None), merged))
+        key = "exact_duplicate_groups" if exact else "complementary_merge_groups"
+        diagnostics[key] += 1
+        diagnostics["collapsed_source_rows"] += len(group) - 1
+    diagnoses = [v.dx for v in visits]
+    ranks = [_DX_RANK[dx] for dx in diagnoses if dx is not None]
+    unresolved = (diagnostics["conflicting_duplicate_groups"]
+                  or diagnostics["ambiguous_same_day_groups"])
+    observed = not unresolved and any(b < a for a, b in pairwise(ranks))
+    diagnostics["observed_reversion_subjects"] = int(observed)
+    reason = None
+    if len(source) < 2:
+        reason = "fewer_than_two_total_visits"
+    elif diagnostics["conflicting_duplicate_groups"]:
+        reason = "conflicting_duplicate_visit"
+    elif diagnostics["ambiguous_same_day_groups"]:
+        reason = "ambiguous_same_day_visits"
+    elif len(visits) < 2:
+        reason = "fewer_than_two_distinct_visits"
+    elif drop_reverters and (explicit or observed):
+        reason = "reverter"
+        diagnostics["additional_explicit_reversion_exclusions"] = int(
+            explicit and not observed
+        )
+    elif len(ranks) < 2:
+        reason = "fewer_than_two_diagnosed_visits"
+    sequence = None if reason else build_sequence(diagnoses, drop_reverters)
+    return _PreparedPatient(source, visits, sequence, reason, diagnostics)
+
+
 def forward_fill(rows: list[list[float]]) -> list[list[float]]:
     """Carries each feature's last observed value forward in time.
 
@@ -254,8 +407,8 @@ class ADProgressionPrediction(BaseTask):
         time_feature: ``"to_target"`` (months from the visit to the target
             visit, the paper's feature), ``"since_previous"`` (months since
             the previous input visit) or ``"none"``.
-        drop_reverters: Drop subjects whose diagnosis reverts (the paper's
-            rule). Default ``True``.
+        drop_reverters: Drop subjects with explicit transition-string or
+            observed-stage reversions anywhere in their history. Default True.
         normalize: Z-score features with training statistics. Default
             ``True``.
         imputer: Optional callable that fills missing feature values of the
@@ -305,6 +458,7 @@ class ADProgressionPrediction(BaseTask):
         self.imputer = imputer
         # Include the sample-layout version in BaseDataset's task cache key.
         self._visit_mask_version = 1
+        self._sequence_policy_version = SEQUENCE_POLICY_VERSION
         self.input_schema = {
             "visits": (
                 "tensor",
@@ -343,11 +497,10 @@ class ADProgressionPrediction(BaseTask):
             ``diagnoses``, the matching diagnoses; ``seq_type``; and
             ``group``, the number of input visits.
         """
-        events = sorted(
-            patient.get_events(event_type="tadpole"), key=lambda e: e.timestamp
-        )
-        diagnoses = [map_diagnosis(getattr(e, "dx", None)) for e in events]
-        sequence = build_sequence(diagnoses, drop_reverters=self.drop_reverters)
+        prepared = prepare_patient_visits(patient, self.drop_reverters)
+        events = prepared.visits
+        diagnoses = [event.dx for event in events]
+        sequence = prepared.sequence
         if sequence is None:
             return None
         input_idx, target_idx, seq_type = sequence
@@ -356,13 +509,7 @@ class ADProgressionPrediction(BaseTask):
         return {
             "patient_id": patient.patient_id,
             "months": [_months_between(start, events[i].timestamp) for i in order],
-            "features": [
-                [
-                    parse_numeric(getattr(events[i], col, None))
-                    for col in FEATURE_COLUMNS
-                ]
-                for i in order
-            ],
+            "features": [list(events[i].features) for i in order],
             "diagnoses": [diagnoses[i] for i in order],
             "seq_type": seq_type,
             "group": len(input_idx),

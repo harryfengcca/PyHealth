@@ -103,13 +103,22 @@ Split folds across jobs with ``--fold k`` (0-9; the ablations have folds
 0-4 and skip higher indices) and aggregate afterwards with
 ``--summarize-only``. Finished runs are skipped on restart.
 
-Outputs, in ``--output-dir/<experiment>/``: ``runs.jsonl`` (one line per
+Use ``--audit-only --root /path/to/tadpole`` to write aggregate cohort
+accounting without fitting processors or training. See
+``examples/tadpole_reproducibility.md`` for provenance and cache behavior.
+
+Outputs, in ``--output-dir/<experiment>/``: ``manifest.json`` (source/code/
+settings identity), ``cohort_*.json`` (aggregate counts), ``runs.jsonl`` (one line per
 config and fold), ``summary.csv`` (mean and std per config) and
 ``summary.md`` (a readable table plus Welch t-tests against the
 Transformer).
 
 Results
 -------
+The historical tables below predate provenance manifests. Their underlying
+run artifacts are unavailable, so these numbers and significance claims are
+unverified and must not be presented as results of the current pipeline.
+
 Setup: TADPOLE D1/D2 (1,548 sequences after the paper's rules: 1,163 stable,
 385 converter), patient-level folds stratified by sequence type and group,
 15% of the training patients held out for early stopping on validation BCA,
@@ -244,15 +253,24 @@ Synthetic smoke test (``--experiment quick``): the pipeline runs end to end
 
 import argparse
 import hashlib
+import io
 import json
 import logging
 import math
 import random
+import os
+import platform
+import subprocess
+import tempfile
+from collections import Counter
+from importlib.metadata import PackageNotFoundError, version
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock
 
 import numpy as np
 import torch
@@ -262,10 +280,13 @@ from sklearn.metrics import f1_score, roc_auc_score, roc_curve
 from torch import nn
 
 from pyhealth.datasets import SampleDataset, Split, TADPOLEDataset, get_dataloader
-from pyhealth.datasets.tadpole import generate_synthetic_tadpole
+from pyhealth.datasets.tadpole import TADPOLE_FILE_NAME, generate_synthetic_tadpole
 from pyhealth.models import RNN, BaseModel, VisitTransformer
 from pyhealth.tasks import ADProgressionPrediction
-from pyhealth.tasks.ad_progression import DX_CLASSES, FEATURE_COLUMNS
+from pyhealth.tasks.ad_progression import (
+    DX_CLASSES, FEATURE_COLUMNS, SEQUENCE_POLICY_VERSION,
+    map_diagnosis, prepare_patient_visits,
+)
 from pyhealth.trainer import Trainer
 
 logger = logging.getLogger("tadpole_example")
@@ -1421,28 +1442,236 @@ def run_fold(
     return metrics
 
 
+def audit_cohort(
+    dataset: TADPOLEDataset, task_params: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Returns split metadata and aggregate accounting without fitting processors.
+
+    Counts describe parsed events, not raw CSV rows rejected by the loader.
+    D1/D2 membership is descriptive; no cohort-selection rule is changed.
+    Excluded-subject visits, selected visits, missing diagnoses before the
+    target, visits after the target, and collapsed duplicate rows in retained
+    subjects form a disjoint ledger. Preparation diagnostics may overlap;
+    duplicate rows in excluded subjects count only as excluded in the ledger.
+    """
+    drop_reverters = task_params.get("drop_reverters", True)
+    excluded = Counter()
+    excluded_visits = Counter()
+    kinds, groups, targets, transitions = Counter(), {}, Counter(), Counter()
+    membership = Counter()
+    meta = []
+    n_subjects = n_visits = selected = missing_prefix = after_target = 0
+    missing_dx = unknown_dx = collapsed_retained = 0
+    diagnostics = Counter()
+    for patient in dataset.iter_patients():
+        prepared = prepare_patient_visits(patient, drop_reverters)
+        events = prepared.source_events
+        diagnostics.update(prepared.diagnostics)
+        n_subjects += 1
+        n_visits += len(events)
+        diagnoses = [map_diagnosis(getattr(e, "dx", None)) for e in events]
+        for event, dx in zip(events, diagnoses):
+            raw = str(getattr(event, "dx", None)).strip().lower()
+            if dx is None:
+                if raw in ("", "nan", "none", "<na>"):
+                    missing_dx += 1
+                else:
+                    unknown_dx += 1
+        for flag in ("d1", "d2"):
+            if any(str(getattr(e, flag, "")).strip() in ("1", "1.0") for e in events):
+                membership[flag] += 1
+        sequence = prepared.sequence
+        if sequence is None:
+            reason = prepared.exclusion_reason
+            assert reason is not None
+            excluded[reason] += 1
+            excluded_visits[reason] += len(events)
+            continue
+        inputs, target, kind = sequence
+        diagnoses = [v.dx for v in prepared.visits]
+        group = len(inputs)
+        selected += group + 1
+        missing_prefix += target + 1 - (group + 1)
+        after_target += len(prepared.visits) - target - 1
+        collapsed_retained += prepared.diagnostics["collapsed_source_rows"]
+        kinds[kind] += 1
+        groups.setdefault(str(group), Counter())[kind] += 1
+        targets[diagnoses[target]] += 1
+        transitions[f"{diagnoses[inputs[-1]]}->{diagnoses[target]}"] += 1
+        meta.append({"pid": str(patient.patient_id), "seq_type": kind, "group": group})
+    ledger = {
+        "excluded_subject_visits": sum(excluded_visits.values()),
+        "selected_input_and_target_visits": selected,
+        "missing_diagnosis_visits_before_target": missing_prefix,
+        "visits_after_selected_target": after_target,
+        "collapsed_duplicate_rows_in_retained_subjects": collapsed_retained,
+    }
+    assert sum(ledger.values()) == n_visits
+    report = {
+        "population": "parsed TADPOLE events; all source subjects, no D1/D2 filter",
+        "drop_reverters": drop_reverters,
+        "sequence_policy_version": SEQUENCE_POLICY_VERSION,
+        "visit_preparation_diagnostics": dict(diagnostics),
+        "subjects": n_subjects,
+        "visits": n_visits,
+        "subjects_by_membership": dict(membership),
+        "excluded_subjects": dict(excluded),
+        "excluded_visits_by_subject_reason": dict(excluded_visits),
+        "retained_subjects": len(meta),
+        "sequences_by_type": dict(kinds),
+        "sequences_by_group": {k: dict(v) for k, v in sorted(groups.items())},
+        "target_diagnoses": dict(targets),
+        "transitions": dict(transitions),
+        "missing_diagnoses": missing_dx,
+        "unrecognized_diagnoses": unknown_dx,
+        "visit_ledger": ledger,
+    }
+    return meta, report
+
+
 def sequence_metadata(
     dataset: TADPOLEDataset, task_params: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Reads patient ID, sequence type and group of every sample.
+    """Reads split metadata directly, without fitting cohort-wide processors."""
+    return audit_cohort(dataset, task_params)[0]
 
-    Args:
-        dataset: The loaded TADPOLE dataset.
-        task_params: Arguments for :class:`ADProgressionPrediction`.
 
-    Returns:
-        One dict per sample with ``pid``, ``seq_type`` and ``group``.
-    """
-    samples = dataset.set_task(ADProgressionPrediction(**task_params))
-    meta = [
-        {
-            "pid": str(s["patient_id"]),
-            "seq_type": s["seq_type"],
-            "group": int(s["group"]),
-        }
-        for s in samples
-    ]
-    return meta
+def _digest(value: Any) -> str:
+    """Stable content identity for JSON-serializable settings."""
+    blob = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    """Streams a source file without exposing its contents."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _code_identity() -> dict[str, Any]:
+    """Records the Git revision and actual executable source/config contents."""
+    root = Path(__file__).resolve().parents[1]
+    paths = [Path(__file__).resolve(), root / "pyproject.toml"]
+    paths += sorted((root / "pyhealth").rglob("*.py"))
+    paths += sorted((root / "pyhealth").rglob("*.yaml"))
+    digest = _digest({str(p.relative_to(root)): _file_digest(p) for p in paths})
+    result = subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "rev-parse", "HEAD"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    return {"source_sha256": digest, "git_revision": result.stdout.strip() or None}
+
+
+def _experiment_identity(args: argparse.Namespace, source: Path, code: dict) -> dict:
+    """Records effective settings; job selectors and cache locations are excluded."""
+    names = (
+        "experiment", "folds", "ablation_folds", "val_ratio", "epochs", "patience",
+        "batch_size", "lr", "weight_decay", "monthly_epochs", "device", "seed",
+    )
+    packages = {}
+    for name in (
+        "torch", "torchvision", "numpy", "scikit-learn", "scipy", "pandas",
+        "polars", "narwhals", "litdata", "pyarrow", "dask", "distributed",
+        "pydantic", "transformers", "peft", "pyhealth",
+    ):
+        try:
+            packages[name] = version(name)
+        except PackageNotFoundError:
+            packages[name] = None
+    return {
+        "schema_version": 1,
+        "settings": {name: getattr(args, name) for name in names},
+        "source_sha256": _file_digest(source),
+        "synthetic": args.root is None,
+        "code": code,
+        "python": platform.python_version(),
+        "packages": packages,
+        "selection_metric": "balanced_accuracy (macro recall), not paper BCA",
+    }
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Atomically replaces an artifact; simultaneous readers see complete files."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _ensure_manifest(out_dir: Path, identity: dict) -> str:
+    """Rejects incompatible resumes and unversioned legacy result directories."""
+    experiment_id = _digest(identity)
+    path = out_dir / "manifest.json"
+    with FileLock(str(out_dir / "manifest.lock")):
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if saved != {"experiment_id": experiment_id, "identity": identity}:
+                raise ValueError("Incompatible experiment: use a new --output-dir.")
+        else:
+            results = out_dir / "runs.jsonl"
+            if results.exists() and results.stat().st_size:
+                raise ValueError(
+                    "Legacy results lack provenance; use a new --output-dir."
+                )
+            _write_atomic(path, json.dumps({
+                "experiment_id": experiment_id, "identity": identity,
+            }, indent=2, sort_keys=True) + "\n")
+    return experiment_id
+
+
+def _run_identity(record: dict) -> str:
+    """Identifies a configuration, fold and exact patient partition by hash."""
+    return _digest({key: record[key] for key in (
+        "experiment_id", "config", "fold", "split",
+    )})
+
+
+def _append_run(path: Path, record: dict) -> None:
+    """Serializes concurrent fold writers and atomically saves complete results."""
+    with FileLock(str(path.with_suffix(".lock"))):
+        runs = load_runs(path)
+        if any(r["run_id"] == record["run_id"] for r in runs):
+            return
+        _validate_runs(runs + [record], path.parent)
+        text = "".join(json.dumps(r) + "\n" for r in runs + [record])
+        _write_atomic(path, text)
+
+
+def _validate_runs(runs: list[dict], out_dir: Path) -> None:
+    """Prevents mixed identities, altered identity fields and duplicate folds."""
+    if not runs:
+        return
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("Results lack a provenance manifest.")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest["experiment_id"] != _digest(manifest["identity"]):
+        raise ValueError("Invalid experiment manifest fingerprint.")
+    seen = set()
+    for run in runs:
+        required = {"experiment_id", "run_id", "config", "fold", "split", "metrics"}
+        if not required.issubset(run):
+            raise ValueError("Incomplete run provenance.")
+        if run.get("experiment_id") != manifest["experiment_id"]:
+            raise ValueError("Results contain missing or mixed experiment provenance.")
+        if run.get("run_id") != _run_identity(run):
+            raise ValueError("Invalid run fingerprint.")
+        key = (run["config"]["name"], run["fold"])
+        if key in seen:
+            raise ValueError("Duplicate configuration/fold results.")
+        seen.add(key)
 
 
 # --------------------------------------------------------------------------
@@ -1455,7 +1684,9 @@ def load_runs(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     with open(path) as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        runs = [json.loads(line) for line in handle if line.strip()]
+    _validate_runs(runs, path.parent)
+    return runs
 
 
 def flatten(metrics: dict[str, Any], prefix: str = "") -> dict[str, float]:
@@ -1504,11 +1735,12 @@ def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
         The markdown table, followed by Welch's t-tests of the Transformer
         against the other models of the same experiment (``WELCH_PAIRS``).
     """
+    _validate_runs(runs, out_dir)
     by_name: dict[str, list[dict[str, float]]] = {}
     for run in runs:
         by_name.setdefault(run["config"]["name"], []).append(flatten(run["metrics"]))
     keys = sorted({k for rows in by_name.values() for row in rows for k in row})
-    with open(out_dir / "summary.csv", "w") as handle:
+    with io.StringIO() as handle:
         handle.write(
             "config,folds," + ",".join(f"{k}_mean,{k}_std" for k in keys) + "\n"
         )
@@ -1521,6 +1753,8 @@ def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
                     f"{np.std(vals):.4f}" if vals else "",
                 ]
             handle.write(f'"{name}",{len(rows)},' + ",".join(cells) + "\n")
+        csv_text = handle.getvalue()
+    _write_atomic(out_dir / "summary.csv", csv_text)
     lines = [
         "| Config | Folds | " + " | ".join(label for _, label in KEY_METRICS) + " |"
     ]
@@ -1558,8 +1792,21 @@ def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
             "| Data | Comparison | Metric | t | p |",
             "| --- | --- | --- | --- | --- |",
         ] + tests
+    if runs:
+        manifest = json.loads((out_dir / "manifest.json").read_text())
+        settings = manifest["identity"]["settings"]
+        lines += ["", "Fold coverage (partial summaries are not full CV results):", ""]
+        for name in by_name:
+            matching = [r for r in runs if r["config"]["name"] == name]
+            group = matching[0]["config"].get("group", "reproduce")
+            n = settings["folds"] if group in (
+                "reproduce", "paper_setup", "quick"
+            ) else settings["ablation_folds"]
+            present = {r["fold"] for r in matching}
+            missing = sorted(set(range(n)) - present)
+            lines.append(f"- {name}: {len(present)}/{n} folds; missing {missing}")
     text = "\n".join(lines) + "\n"
-    (out_dir / "summary.md").write_text(text)
+    _write_atomic(out_dir / "summary.md", text)
     return text
 
 
@@ -1630,12 +1877,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--synthetic-patients", type=int, default=600)
     parser.add_argument("--summarize-only", action="store_true")
+    parser.add_argument("--audit-only", action="store_true",
+                        help="Write aggregate cohort accounting without training.")
     args = parser.parse_args(argv)
     if args.experiment == "quick":
         args.folds = args.ablation_folds = 2
         args.epochs = min(args.epochs, 2)
         args.monthly_epochs = min(args.monthly_epochs, 2)
         args.synthetic_patients = min(args.synthetic_patients, 200)
+    if args.folds < 2 or args.ablation_folds < 2:
+        parser.error("fold counts must be at least 2")
+    if not 0 < args.val_ratio < 1:
+        parser.error("--val-ratio must be between 0 and 1")
+    if args.fold is not None and args.fold < 0:
+        parser.error("--fold must be nonnegative")
+    if min(args.epochs, args.monthly_epochs, args.batch_size,
+           args.synthetic_patients, args.num_workers) < 1:
+        parser.error(
+            "epochs, batch size, patient count and worker count must be positive"
+        )
+    if (not math.isfinite(args.lr) or not math.isfinite(args.weight_decay)
+            or args.lr <= 0 or args.weight_decay < 0 or args.patience < 1):
+        parser.error("invalid learning rate, weight decay or patience")
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     return args
@@ -1649,24 +1912,44 @@ def main(argv: Sequence[str] | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     runs_path = out_dir / "runs.jsonl"
     if args.summarize_only:
-        print(summarize(load_runs(runs_path), out_dir))
+        with FileLock(str(out_dir / "summary.lock")):
+            print(summarize(load_runs(runs_path), out_dir))
         return
 
+    code = _code_identity()
     root = args.root
     if root is None:
-        root = str(Path(args.output_dir) / "synthetic_tadpole")
-        generate_synthetic_tadpole(
-            root, num_patients=args.synthetic_patients, seed=args.seed
-        )
+        tag = f"{code['source_sha256'][:12]}_{args.seed}_{args.synthetic_patients}"
+        root = str(Path(args.output_dir) / "synthetic_tadpole" / tag)
+        if not (Path(root) / TADPOLE_FILE_NAME).exists():
+            generate_synthetic_tadpole(
+                root, num_patients=args.synthetic_patients, seed=args.seed
+            )
         logger.info("Using synthetic data in %s", root)
+    identity = _experiment_identity(args, Path(root) / TADPOLE_FILE_NAME, code)
+    experiment_id = None if args.audit_only else _ensure_manifest(out_dir, identity)
+    cache_tag = f"{code['source_sha256'][:12]}_{identity['source_sha256'][:12]}"
+    cache_root = Path(args.cache_dir or Path(args.output_dir) / "private_cache")
     dataset = TADPOLEDataset(
-        root=root, cache_dir=args.cache_dir, num_workers=args.num_workers
+        root=root, cache_dir=cache_root / cache_tag, num_workers=args.num_workers
     )
+    if args.audit_only:
+        _, report = audit_cohort(dataset, {})
+        report["source_sha256"] = identity["source_sha256"]
+        _write_atomic(out_dir / "cohort_default.json", json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2))
+        return
 
     configs = experiment_configs(args.experiment)
     if args.only:
         configs = [c for c in configs if any(s in c.name for s in args.only)]
-    done = {(r["config"]["name"], r["fold"]) for r in load_runs(runs_path)}
+    if not configs:
+        raise ValueError("No configurations match --only.")
+    limits = [args.folds if c.group in ("reproduce", "paper_setup", "quick")
+              else args.ablation_folds for c in configs]
+    if args.fold is not None and not any(args.fold < n for n in limits):
+        raise ValueError("--fold is outside all selected configurations.")
+    done = {r["run_id"] for r in load_runs(runs_path)}
     meta_cache: dict[str, list[dict[str, Any]]] = {}
     ctx = MonthlyContext(dataset, args)
 
@@ -1680,7 +1963,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             {"drop_reverters": cfg.task_params.get("drop_reverters", True)}
         )
         if meta_key not in meta_cache:
-            meta_cache[meta_key] = sequence_metadata(dataset, json.loads(meta_key))
+            meta_cache[meta_key], report = audit_cohort(dataset, json.loads(meta_key))
+            report["source_sha256"] = identity["source_sha256"]
+            name = (
+                "default" if json.loads(meta_key)["drop_reverters"]
+                else "keep_reverters"
+            )
+            _write_atomic(out_dir / f"cohort_{name}.json", json.dumps(report, indent=2))
         meta = meta_cache[meta_key]
         keep = balanced_patients(meta, args.seed) if cfg.data == "balanced" else None
         splits = plan_folds(meta, n_folds, args.val_ratio, args.seed, keep)
@@ -1691,22 +1980,32 @@ def main(argv: Sequence[str] | None = None) -> None:
             # --fold may name; such configs have nothing to run here.
             folds = [args.fold] if args.fold < n_folds else []
         for k in folds:
-            if (cfg.name, k) in done:
+            split = splits[k]
+            record = {
+                "experiment_id": experiment_id,
+                "config": asdict(cfg),
+                "fold": k,
+                "split": {
+                    "fingerprint": split.to_dict(),
+                    "sizes": {part: len(getattr(split, part))
+                              for part in ("train", "val", "test")},
+                },
+            }
+            record["run_id"] = _run_identity(record)
+            if record["run_id"] in done:
                 logger.info("Skipping %s fold %d (done)", cfg.name, k)
                 continue
             logger.info("Running %s fold %d/%d", cfg.name, k + 1, n_folds)
-            metrics = run_fold(dataset, cfg, splits[k], args, ctx)
-            record = {
-                "config": asdict(cfg),
-                "fold": k,
+            metrics = run_fold(dataset, cfg, split, args, ctx)
+            record.update({
                 "metrics": metrics,
                 "seed": args.seed,
                 "epochs": (
                     args.monthly_epochs if cfg.model in MONTHLY_CELLS else args.epochs
                 ),
-            }
-            with open(runs_path, "a") as handle:
-                handle.write(json.dumps(record) + "\n")
+            })
+            _append_run(runs_path, record)
+            done.add(record["run_id"])
             o = metrics["overall"]
             logger.info(
                 "%s fold %d: BCA %.3f mAUC %.3f conv acc %s",
@@ -1716,7 +2015,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 o["mauc"],
                 f"{metrics.get('converter', {}).get('accuracy', float('nan')):.3f}",
             )
-    print(summarize(load_runs(runs_path), out_dir))
+    with FileLock(str(out_dir / "summary.lock")):
+        print(summarize(load_runs(runs_path), out_dir))
 
 
 if __name__ == "__main__":
