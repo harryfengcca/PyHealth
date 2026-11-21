@@ -343,11 +343,11 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
     Returns:
         The run configurations, in the order they are run.
     """
-    # Reproduction: the paper's three models on the raw and balanced data.
+    # Matched-objective models plus a no-training persistence baseline.
     reproduce = [
         RunConfig(f"{data}/{model}", model=model, data=data, group="reproduce")
         for data in ("raw", "balanced")
-        for model in ("visit_transformer", "lstm", "gru")
+        for model in ("visit_transformer", "lstm", "gru", "copy_last")
     ]
     # The paper's own setup. "Model filling" replaces forward fill: missing
     # input values are predicted by a minimalRNN trained month by month on
@@ -380,6 +380,11 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
             )
             for cell in ("minrnn", "lstm", "gru")
         ]
+    paper_setup += [
+        RunConfig(f"{data}/copy_last", model="copy_last", data=data,
+                  group="paper_setup")
+        for data in ("raw", "balanced")
+    ]
     # Task ablation: one row per task variant; only ``task_params`` change.
     # T0 is the paper's task. T1 asks how much forward filling the missing
     # measurements matters (and whether explicit "was missing" flags help).
@@ -445,6 +450,10 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
             group="quick",
         ),
     ]
+    quick += [
+        RunConfig(f"{data}/copy_last", model="copy_last", data=data, group="quick")
+        for data in ("raw", "balanced")
+    ]
     table = {
         "reproduce": reproduce,
         "paper_setup": paper_setup,
@@ -453,7 +462,9 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
         "quick": quick,
     }
     if experiment == "all":
-        return reproduce + paper_setup + task_ablation + model_ablation
+        # The no-training baseline is identical across these two suites.
+        return (reproduce + [c for c in paper_setup if c.model != "copy_last"]
+                + task_ablation + model_ablation)
     return table[experiment]
 
 
@@ -1277,6 +1288,82 @@ def predict(
     }
 
 
+def predict_copy_last(raw: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Predicts the last historical diagnosis without learning parameters.
+
+    The target diagnosis is read only to construct evaluation labels. Scores
+    are one-hot hard decisions in ``DX_CLASSES`` order, not calibrated risk
+    estimates. Features and visit times are never used.
+
+    Args:
+        raw: Task raw sequences, each containing historical diagnoses followed
+            by one held-out target diagnosis and a historical visit ``group``.
+
+    Returns:
+        The same canonical arrays as :func:`predict`, including an empty
+        ``[0, 3]`` probability array when no sequences are supplied.
+
+    Examples:
+        >>> pred = predict_copy_last([{
+        ...     "diagnoses": ["CN", "MCI"], "group": 1,
+        ...     "seq_type": "converter",
+        ... }])
+        >>> pred["prob"].tolist()
+        [[1.0, 0.0, 0.0]]
+    """
+    rank = {dx: i for i, dx in enumerate(DX_CLASSES)}
+    labels, last_dx, seq_types = [], [], []
+    for seq in raw:
+        n = seq["group"]
+        diagnoses = seq["diagnoses"]
+        if n < 1 or len(diagnoses) != n + 1:
+            raise ValueError("Expected historical visits and one held-out target.")
+        last_dx.append(rank[diagnoses[n - 1]])
+        labels.append(rank[diagnoses[n]])
+        seq_types.append(seq["seq_type"])
+    last = np.asarray(last_dx, dtype=int)
+    return {
+        "y": np.asarray(labels, dtype=int),
+        "prob": np.eye(len(DX_CLASSES), dtype=float)[last],
+        "seq_type": np.asarray(seq_types, dtype=str),
+        "last_dx": last,
+    }
+
+
+def run_copy_last_fold(
+    cfg: RunConfig, split: PatientListSplit, ctx: "MonthlyContext"
+) -> dict[str, Any]:
+    """Evaluates persistence on the shared test split without fitting anything.
+
+    Args:
+        cfg: Baseline configuration with the sequence exclusion policy.
+        split: The same patient split used by the learned comparisons.
+        ctx: Shared access to task raw sequences; no models are requested.
+
+    Returns:
+        Standard evaluation metrics, zero training seconds/parameters, and
+        sizes of the comparison partitions (training/validation are unused).
+
+    Examples:
+        >>> RunConfig("raw/copy_last", model="copy_last").model
+        'copy_last'
+    """
+    raw = ctx.raw(cfg.task_params.get("drop_reverters", True))
+    if not split.test:
+        raise ValueError("Copy-last evaluation requires a nonempty test split.")
+    if any(pid not in raw for pid in split.test):
+        raise ValueError("A test patient is missing from the prepared cohort.")
+    metrics = evaluate(predict_copy_last([raw[pid] for pid in split.test]))
+    metrics.update({
+        "train_seconds": 0.0,
+        "n_params": 0,
+        "n_train": len(split.train),
+        "n_val": len(split.val),
+        "n_test": len(split.test),
+    })
+    return metrics
+
+
 class MonthlyContext:
     """Raw sequences and month-by-month models shared by the runs of a fold.
 
@@ -1403,6 +1490,8 @@ def run_fold(
         The fold's metrics, training time and split sizes.
     """
     ctx = ctx or MonthlyContext(dataset, args)
+    if cfg.model == "copy_last":
+        return run_copy_last_fold(cfg, split, ctx)
     if cfg.model in MONTHLY_CELLS:
         return run_monthly_fold(cfg, split, ctx)
     task_params = dict(cfg.task_params)
@@ -2001,6 +2090,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "metrics": metrics,
                 "seed": args.seed,
                 "epochs": (
+                    0 if cfg.model == "copy_last" else
                     args.monthly_epochs if cfg.model in MONTHLY_CELLS else args.epochs
                 ),
             })

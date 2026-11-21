@@ -5,6 +5,8 @@ import io
 import json
 import tempfile
 import unittest
+
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -278,6 +280,136 @@ class TestTadpoleExperimentProvenance(unittest.TestCase):
         runs = pipeline.load_runs(path)
         self.assertEqual(len(runs), 1)
         self.assertNotIn("patient_id", json.dumps(runs))
+
+
+class TestCopyLastDiagnosis(unittest.TestCase):
+    """Verify persistence predictions and integration without training."""
+
+    @staticmethod
+    def _sequence(history, target, kind):
+        return {"diagnoses": history + [target], "group": len(history),
+                "seq_type": kind}
+
+    def test_canonical_predictions_and_stable_converter_accuracy(self):
+        raw = [
+            self._sequence(["CN", "CN"], "CN", "stable"),
+            self._sequence(["MCI"], "MCI", "stable"),
+            self._sequence(["MCI", "AD"], "AD", "stable"),
+            self._sequence(["CN"], "MCI", "converter"),
+            self._sequence(["CN", "MCI"], "AD", "converter"),
+        ]
+        pred = pipeline.predict_copy_last(raw)
+        np.testing.assert_array_equal(pred["prob"].argmax(1), [0, 1, 2, 0, 1])
+        np.testing.assert_array_equal(pred["prob"].sum(1), np.ones(5))
+        metrics = pipeline.evaluate(pred)
+        self.assertEqual(metrics["overall"]["accuracy"], 3 / 5)
+        self.assertEqual(metrics["stable"]["accuracy"], 1)
+        self.assertEqual(metrics["converter"]["accuracy"], 0)
+
+    def test_target_changes_only_labels_not_predictions(self):
+        first = self._sequence(["CN", "MCI"], "MCI", "stable")
+        second = self._sequence(["CN", "MCI"], "AD", "converter")
+        second["features"] = object()  # Unreadable, unused measurements.
+        second["months"] = object()
+        a, b = (pipeline.predict_copy_last([s]) for s in (first, second))
+        np.testing.assert_array_equal(a["prob"], b["prob"])
+        self.assertNotEqual(a["y"][0], b["y"][0])
+
+    def test_empty_and_invalid_history(self):
+        empty = pipeline.predict_copy_last([])
+        self.assertEqual(empty["prob"].shape, (0, 3))
+        for n, diagnoses in [(0, ["CN"]), (2, ["CN", "MCI"])]:
+            with self.subTest(n=n), self.assertRaisesRegex(ValueError, "held-out"):
+                pipeline.predict_copy_last([{
+                    "group": n, "diagnoses": diagnoses, "seq_type": "stable",
+                }])
+
+    def test_fold_uses_only_requested_test_patients_without_fitting(self):
+        cfg = pipeline.RunConfig("raw/copy_last", model="copy_last")
+        split = pipeline.PatientListSplit(("train",), ("val",), ("test",))
+        ctx = mock.Mock()
+        # Train/validation values cannot supply predictions or be inspected.
+        ctx.raw.return_value = {
+            "train": object(), "val": object(),
+            "test": self._sequence(["CN"], "MCI", "converter"),
+        }
+        dataset = mock.Mock()
+        with (
+            mock.patch.object(pipeline, "Trainer") as trainer,
+            mock.patch.object(pipeline, "build_model") as model,
+        ):
+            metrics = pipeline.run_fold(dataset, cfg, split, mock.Mock(), ctx)
+        ctx.raw.assert_called_once_with(True)
+        ctx.model.assert_not_called()
+        ctx.filler.assert_not_called()
+        dataset.set_task.assert_not_called()
+        trainer.assert_not_called()
+        model.assert_not_called()
+        self.assertEqual(metrics["overall"]["accuracy"], 0)
+        for key in ("n_params", "train_seconds"):
+            self.assertEqual(metrics[key], 0)
+        for key in ("n_train", "n_val", "n_test"):
+            self.assertEqual(metrics[key], 1)
+        with self.assertRaisesRegex(ValueError, "missing"):
+            pipeline.run_copy_last_fold(
+                cfg, pipeline.PatientListSplit((), (), ("missing",)), ctx
+            )
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            pipeline.run_copy_last_fold(
+                cfg, pipeline.PatientListSplit((), (), ()), ctx
+            )
+
+    def test_real_task_sequences_share_cohort_and_baseline_expectations(self):
+        with tempfile.TemporaryDirectory() as root:
+            patients = fixture_patients(root)
+            task = pipeline.ADProgressionPrediction()
+            raw = [task.raw_sequence(p) for p in patients.values()]
+        pred = pipeline.predict_copy_last([s for s in raw if s is not None])
+        metrics = pipeline.evaluate(pred)
+        self.assertEqual(metrics["overall"]["n"], 3)
+        self.assertEqual(metrics["overall"]["accuracy"], 1 / 3)
+        self.assertEqual(metrics["stable"]["accuracy"], 1)
+        self.assertEqual(metrics["converter"]["accuracy"], 0)
+
+    def test_baseline_configs_are_unique_in_each_suite(self):
+        for suite in ("reproduce", "paper_setup", "quick", "all"):
+            with self.subTest(suite=suite):
+                configs = [c for c in pipeline.experiment_configs(suite)
+                           if c.model == "copy_last"]
+                self.assertEqual({c.name for c in configs},
+                                 {"raw/copy_last", "balanced/copy_last"})
+                self.assertEqual(len(configs), 2)
+
+    def test_cli_records_zero_epochs_and_resumes_without_training(self):
+        with tempfile.TemporaryDirectory() as root:
+            patients = fixture_patients(root)
+            dataset = SimpleNamespace(iter_patients=lambda: iter(patients.values()))
+            argv = ["--root", root, "--experiment", "reproduce", "--device", "cpu",
+                    "--output-dir", str(Path(root) / "out"), "--folds", "2",
+                    "--fold", "0", "--only", "raw/copy_last"]
+            # Fixture is too small for stratification: explicitly fix the
+            # comparison split and exercise the real baseline/provenance path.
+            task = pipeline.ADProgressionPrediction()
+            ids = [str(p.patient_id) for p in patients.values()
+                   if task.raw_sequence(p) is not None]
+            split = pipeline.PatientListSplit((ids[0],), (ids[1],), (ids[2],))
+            with (
+                mock.patch.object(pipeline, "TADPOLEDataset", return_value=dataset),
+                mock.patch.object(pipeline, "plan_folds", return_value=[split, split]),
+                mock.patch.object(pipeline, "Trainer") as trainer,
+                mock.patch.object(pipeline.MonthlyContext, "model") as monthly,
+                redirect_stdout(io.StringIO()),
+            ):
+                pipeline.main(argv)
+                pipeline.main(argv)
+            trainer.assert_not_called()
+            monthly.assert_not_called()
+            out = Path(root) / "out/reproduce"
+            runs = pipeline.load_runs(out / "runs.jsonl")
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["epochs"], 0)
+            self.assertEqual(runs[0]["metrics"]["n_params"], 0)
+            self.assertIn("raw/copy_last", (out / "summary.md").read_text())
 
 
 if __name__ == "__main__":

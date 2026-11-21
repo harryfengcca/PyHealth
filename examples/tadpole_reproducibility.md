@@ -96,3 +96,33 @@ bucket only for retained subjects. Thus no row is counted twice. The task's
 sequence-policy cache version changes automatically, and experiment code
 fingerprints reject resumes from the previous policy. Use a fresh output
 directory for the new audit and experiments, preserving earlier reports.
+
+## Copy-last-diagnosis baseline
+
+`reproduce`, `paper_setup`, and `quick` include `raw/copy_last` and
+`balanced/copy_last`; `all` runs each baseline once. They use exactly the
+patient splits and sequence policy of the corresponding learned comparisons.
+Run only these configurations without training:
+
+```bash
+python examples/tadpole_ad_progression_prediction_visit_transformer.py \
+  --root /authorized/local/tadpole --experiment reproduce --only copy_last \
+  --output-dir output/tadpole-copy-last
+```
+
+Omit `--root` to check the workflow with synthetic data. A fresh output directory
+is required after code changes, as for other experiments.
+
+The prediction is the last **historical** diagnosis; the held-out diagnosis is
+used only for evaluation. No features, visit dates, fitted preprocessing, model
+filling, or training/validation labels are used to make predictions. Partition
+sizes describe the comparison split; `epochs`, `n_params`, and `train_seconds`
+are zero. Scores are one-hot decisions rather than calibrated probabilities.
+The existing metrics handle ties in these hard scores; AUC should therefore be
+interpreted as discrimination of the hard rule, not learned risk ranking.
+
+With the default progression-only protocol, stable accuracy should be 1 and
+converter accuracy 0, while overall accuracy is the stable fraction. This is a
+sanity check, not evidence of clinical predictive performance. The baseline is
+an additional team comparison, not one of the paper's learned models. It does
+not establish that the other evaluation metrics have been fully validated.
