@@ -1,4 +1,6 @@
+import math
 from collections.abc import Iterable
+from itertools import chain
 from typing import Any, Literal
 
 import torch
@@ -23,6 +25,9 @@ class TensorProcessor(FeatureProcessor):
           missing-value indicators (1 where the value is NaN) appended, and
           NaN filled with 0, in that order. After ``"zscore"``
           normalization, 0 is the training mean.
+        - Infinite training measurements cannot define normalization statistics
+          and raise ValueError. Zero imputation preserves signed infinity so
+          downstream models can reject invalid retained observations.
 
     Output:
         - torch.Tensor with appropriate shape and dtype
@@ -50,7 +55,7 @@ class TensorProcessor(FeatureProcessor):
         normalization: Normalization = None,
         missing_indicators: bool = False,
         impute_strategy: Literal["zero"] | None = None,
-    ):
+    ) -> None:
         """
         Initialize the TensorProcessor.
 
@@ -87,8 +92,14 @@ class TensorProcessor(FeatureProcessor):
         Args:
             samples: Iterable of sample dictionaries.
             field: The field name to extract from samples.
+
+        Raises:
+            ValueError: If normalization training values contain infinity,
+                or the fitted center or scale is non-finite.
         """
-        for sample in samples:
+        sample_iterator = iter(samples)
+        first_sample = None
+        for sample in sample_iterator:
             if field in sample and sample[field] is not None:
                 value = sample[field]
                 tensor = (
@@ -98,19 +109,46 @@ class TensorProcessor(FeatureProcessor):
                 )
                 self._n_dim = tensor.dim()
                 self._feature_dim = tensor.shape[-1] if tensor.dim() > 0 else 1
+                first_sample = sample
                 break
 
         if self.normalization is not None:
+            # Include the sample used for shape inference in one-pass streams.
+            fit_samples = chain(
+                () if first_sample is None else (first_sample,), sample_iterator
+            )
             self.center, self.scale = fit_normalization(
                 (
-                    torch.as_tensor(sample[field], dtype=torch.float64)
-                    .reshape(-1, self._feature_dim)
-                    .numpy()
-                    for sample in samples
+                    self._normalization_input(sample[field]).numpy()
+                    for sample in fit_samples
                     if sample.get(field) is not None
                 ),
                 self.normalization,
             )
+            if not all(math.isfinite(value) for value in self.center + self.scale):
+                raise ValueError(
+                    "TensorProcessor fitted non-finite normalization statistics"
+                )
+
+    def _normalization_input(self, value: Any) -> torch.Tensor:
+        """Checks a training value before it contributes to fitted statistics.
+
+        Args:
+            value: One raw numeric sample, with NaN for missing entries.
+
+        Returns:
+            A float64 tensor of shape ``[N, F]`` for normalization fitting.
+
+        Raises:
+            ValueError: If a training measurement is infinite.
+        """
+        tensor = torch.as_tensor(value, dtype=torch.float64)
+        if torch.isinf(tensor).any():
+            raise ValueError(
+                "TensorProcessor cannot fit normalization on infinite values; "
+                "use finite measurements or NaN for missing values."
+            )
+        return tensor.reshape(-1, self._feature_dim)
 
     def process(self, value: Any) -> torch.Tensor:
         """
@@ -120,7 +158,8 @@ class TensorProcessor(FeatureProcessor):
             value: Input value (list of numbers or nested lists)
 
         Returns:
-            torch.Tensor: Processed tensor
+            Processed tensor. With zero imputation, only NaN is replaced;
+            signed infinity is preserved for downstream input validation.
         """
         # Prefer to avoid constructing a new tensor from an existing tensor
         # which can trigger a UserWarning. If value is already a tensor,
@@ -141,7 +180,7 @@ class TensorProcessor(FeatureProcessor):
                 tensor = tensor.reshape(1)
             indicators = torch.isnan(tensor).to(self.dtype)
         if self.impute_strategy == "zero":
-            tensor = torch.nan_to_num(tensor, nan=0.0)
+            tensor = tensor.masked_fill(torch.isnan(tensor), 0.0)
         if self.missing_indicators:
             tensor = torch.cat([tensor, indicators], dim=-1)
         return tensor
@@ -160,10 +199,11 @@ class TensorProcessor(FeatureProcessor):
         return feature_dim * 2
 
     def is_token(self) -> bool:
-        """Whether the output tensor represents discrete token indices, inferred from dtype.
+        """Whether the tensor represents discrete tokens, inferred from dtype.
 
         Returns:
-            True if dtype is integer (discrete tokens), False if floating point (continuous).
+            True for integer dtype (discrete tokens), False for floating-point
+            dtype (continuous values).
         """
         return not self.dtype.is_floating_point
 
@@ -202,8 +242,7 @@ class TensorProcessor(FeatureProcessor):
             return self._spatial_dims
         if self._n_dim is None:
             raise NotImplementedError(
-                "TensorProcessor cannot determine spatial dims. "
-                "Call fit() first."
+                "TensorProcessor cannot determine spatial dims. Call fit() first."
             )
         return tuple(False for _ in range(self._output_n_dim()))
 
