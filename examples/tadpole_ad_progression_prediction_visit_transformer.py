@@ -14,7 +14,7 @@ Paper:
 Description:
     Full pipeline, reproduction experiments and ablations.
 
-Reproduction of Moghaddami, Schubring and Siadat, "Transformer Model for
+Reproduction attempt of Moghaddami, Schubring and Siadat, "Transformer Model for
 Alzheimer's Disease Progression Prediction Using Longitudinal Visit
 Sequences", CHIL 2025 (https://proceedings.mlr.press/v287/moghaddami25a.html),
 plus ablations that are not in the paper.
@@ -34,16 +34,20 @@ imputation statistics are fitted on the training patients only.
 Experiments (``--experiment``)
 ------------------------------
 ``reproduce``
-    VisitTransformer, LSTM and GRU on the raw and the balanced dataset
-    (stable sequences dropped within each group until they match the
-    converters), 10 folds. LSTM and GRU are PyHealth's ``RNN`` trained with
+    The default encoder-only team variant of VisitTransformer, LSTM and GRU
+    on the raw and the balanced dataset
+    (the majority sequence type is downsampled within each group), 10 folds.
+    Scarce-stable groups also downsample converters, a team extension of the
+    paper's stable-only rule. LSTM and GRU are PyHealth's ``RNN`` trained with
     the same next-visit objective as the Transformer.
 ``paper_setup`` (10 folds)
-    The paper's own setup, on the same folds: its encoder-decoder
-    Transformer and the TST (Zerveas et al., 2021), both on inputs imputed
+    A paper-oriented reconstruction on the same folds: an approximate
+    encoder-decoder Transformer and adapted TST (Zerveas et al., 2021),
+    both on inputs imputed
     by "model filling" with a minimalRNN trained on the training patients
     of the fold; and its minimalRNN, LSTM and GRU baselines trained month by
-    month as in Nguyen et al. Compare with the paper's Tables 2-5.
+    month as in Nguyen et al. Compare with the paper's Tables 2-5 while
+    disclosing unresolved model differences in ``tadpole_reproducibility.md``.
 ``task_ablation`` (new, not in the paper; 5 folds)
     Varies the task, with the model fixed. Every task configuration is run
     with PyHealth's existing ``RNN`` (LSTM) and with ``VisitTransformer``, so
@@ -55,7 +59,7 @@ Experiments (``--experiment``)
 ``model_ablation`` (new, not in the paper; 5 folds)
     Varies the model, with the task fixed at the default. M2 class
     imbalance: cross-entropy vs. class-weighted cross-entropy vs. focal loss.
-    M3 architecture and hyperparameters: the paper's encoder-decoder
+    M3 architecture and hyperparameters: the approximate encoder-decoder
     configuration, embedding size, depth, dropout, learning rate.
 ``all``
     The four above. ``quick`` runs a two-fold, two-epoch smoke test.
@@ -66,20 +70,36 @@ against the true converters (AUROC, and sensitivity at 90% specificity).
 This tests whether a model's converter accuracy reflects better ranking or
 only a shifted decision threshold.
 
-Metrics follow the paper (Section 4.3): Hand-Till mAUC, F1, accuracy, and
-per-subset sensitivity, specificity and balanced class accuracy (BCA). The
-paper does not say how F1 is averaged; the table reports weighted F1 and
-``summary.csv`` also has macro F1. Sensitivity and specificity are averaged
-over all three classes, with a class that has no positives in the subset
-counted as 0 (this reproduces, e.g., the paper's converter-subset
-sensitivity of 0.430 = (0 + 0.645 + 0.645) / 3), and
-BCA = (sensitivity + specificity) / 2.
+Metric definitions follow the paper's Section 2.5 where specified: Hand-Till
+mAUC, F1, accuracy, sensitivity, specificity and balanced class accuracy
+(BCA). BCA = (macro sensitivity + macro specificity) / 2 over CN/MCI/AD.
+The following edge-case conventions are team choices, not established
+author implementation: undefined sensitivity/specificity denominators
+contribute 0; Hand-Till averages pairs of classes present in the subset and
+is undefined with fewer than two observed classes; F1 is reported both
+support-weighted and macro-averaged over classes present in the true labels,
+with zero-division terms set to 0. See ``tadpole_reproducibility.md``.
+
+Summaries count finite-value folds separately for every metric. Missing,
+NaN and infinite values do not contribute. Standard deviation uses ddof=0
+for at least two finite fold values and is left undefined otherwise;
+completed-run coverage alone does not establish complete metric coverage.
 
 Ablation M1 (new, not in the paper) compares the two ways of training the
 recurrent baselines on the same folds: next-visit classification
 (``reproduce``) and the paper's month-by-month forecasting
-(``paper_setup``). It separates the effect of the training objective from
-the effect of the architecture.
+(``paper_setup``). Input representation, imputation, dropout, learning rate
+and stopping rules also change: M1 compares full protocols and does not
+isolate a causal effect of the training objective alone.
+
+Model assumptions: ``paper_setup`` matches reported layer counts and width,
+but learned query/readout, learned positions, pre-norm/final layer norms,
+feed-forward width, dropout and initialization are team choices. The model
+has 8,460,035 parameters with the default task, compared with 6,603,267
+reported in the paper. TST's validity-aware normalization and singleton
+fallback are team adaptations. These differences and the encoder-only
+default are documented in ``tadpole_reproducibility.md``; no exact model or
+numerical reproduction is established.
 
 Usage
 -----
@@ -112,6 +132,10 @@ settings identity), ``cohort_*.json`` (aggregate counts), ``runs.jsonl`` (one li
 config and fold), ``summary.csv`` (mean and std per config) and
 ``summary.md`` (a readable table plus Welch t-tests against the
 Transformer).
+
+Current synthetic validation, separate from the historical tables below, is
+documented in ``examples/tadpole_model_validation.md`` with aggregate run records
+and reproducible commands.
 
 Results
 -------
@@ -252,29 +276,30 @@ Synthetic smoke test (``--experiment quick``): the pipeline runs end to end
 """
 
 import argparse
+import csv
 import hashlib
 import io
 import json
 import logging
 import math
-import random
 import os
 import platform
+import random
 import subprocess
 import tempfile
-from collections import Counter
-from importlib.metadata import PackageNotFoundError, version
 import time
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+from importlib.metadata import PackageNotFoundError, version
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
-
-from filelock import FileLock
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from filelock import FileLock
 from scipy import stats
 from sklearn.metrics import f1_score, roc_auc_score, roc_curve
 from torch import nn
@@ -284,17 +309,27 @@ from pyhealth.datasets.tadpole import TADPOLE_FILE_NAME, generate_synthetic_tadp
 from pyhealth.models import RNN, BaseModel, VisitTransformer
 from pyhealth.tasks import ADProgressionPrediction
 from pyhealth.tasks.ad_progression import (
-    DX_CLASSES, FEATURE_COLUMNS, SEQUENCE_POLICY_VERSION,
-    map_diagnosis, prepare_patient_visits,
+    DX_CLASSES,
+    FEATURE_COLUMNS,
+    SEQUENCE_POLICY_VERSION,
+    map_diagnosis,
+    prepare_patient_visits,
 )
 from pyhealth.trainer import Trainer
 
 logger = logging.getLogger("tadpole_example")
 
+FOLD_POLICY_VERSION = 2
+BALANCE_POLICY_VERSION = 2
+METRIC_POLICY_VERSION = 1
+SUMMARY_FORMAT_VERSION = 2
+
 # --------------------------------------------------------------------------
 # Experiment configurations
 # --------------------------------------------------------------------------
 
+# Reported dimensions only; query/readout and other choices remain assumptions.
+# See tadpole_reproducibility.md for the unresolved parameter-count difference.
 PAPER_ARCH = {
     "architecture": "encoder_decoder",
     "embedding_dim": 256,
@@ -302,8 +337,8 @@ PAPER_ARCH = {
     "num_layers": 4,
     "num_decoder_layers": 8,
 }
-# TST with the defaults of Zerveas et al. (2021). Every input is padded to
-# ``max_visits``, which must cover the longest input sequence (12 visits).
+# Team TST settings based on Zerveas et al. (2021), with adapted normalization.
+# Inputs are padded or truncated to max_visits; 16 is a team setting.
 TST_PARAMS = {
     "architecture": "tst",
     "embedding_dim": 64,
@@ -349,7 +384,8 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
         for data in ("raw", "balanced")
         for model in ("visit_transformer", "lstm", "gru", "copy_last")
     ]
-    # The paper's own setup. "Model filling" replaces forward fill: missing
+    # Paper-oriented reconstruction; model assumptions are documented above.
+    # "Model filling" replaces forward fill: missing
     # input values are predicted by a minimalRNN trained month by month on
     # the training patients of the fold. The RNN baselines are trained the
     # same month-by-month way (Nguyen et al.), not as next-visit classifiers.
@@ -477,7 +513,7 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
 class PatientListSplit(Split):
     """Train / validation / test parts given as explicit patient ID lists.
 
-    Patients outside all three lists (e.g. stable sequences dropped by the
+    Patients outside all three lists (e.g. sequences dropped by the
     balanced dataset) are left out.
     """
 
@@ -517,19 +553,36 @@ def plan_folds(
 ) -> list[PatientListSplit]:
     """Assigns patients to folds, stratified by sequence type and group.
 
-    Groups above 6 are pooled into one stratum because they are small.
+    Groups above 6 are pooled into one stratum because they are small. A
+    seeded round-robin assignment balances total test-fold sizes while
+    retaining stratum counts within one patient of each other. Validation
+    uses a global target allocated proportionally by largest remainders.
+    Every partition is nonempty; requested folds are never silently removed.
 
     Args:
         meta: One dict per sequence with ``pid``, ``seq_type`` and ``group``.
         n_folds: Number of folds.
-        val_ratio: Share of each fold's training patients used for
-            validation (early stopping), per stratum.
+        val_ratio: Share of the non-test patients used for validation.
+            The rounded global count is clamped to reserve at least one
+            training patient and one validation patient.
         seed: Random seed.
         keep: If given, only these patients are used.
 
     Returns:
         One :class:`PatientListSplit` per fold.
+
+    Raises:
+        ValueError: If settings or patient IDs are invalid, or the selected
+            cohort cannot support nonempty train, validation and test parts.
     """
+    if isinstance(n_folds, bool) or not isinstance(n_folds, Integral) or n_folds < 2:
+        raise ValueError("n_folds must be an integer of at least 2")
+    if (
+        not isinstance(val_ratio, Real)
+        or not math.isfinite(val_ratio)
+        or not 0 < val_ratio < 1
+    ):
+        raise ValueError("val_ratio must be finite and between 0 and 1")
     rng = random.Random(seed)
     strata: dict[str, list[str]] = {}
     for m in meta:
@@ -537,24 +590,50 @@ def plan_folds(
             continue
         key = f"{m['seq_type']}-{min(m['group'], 6)}"
         strata.setdefault(key, []).append(m["pid"])
+    pids = [pid for rows in strata.values() for pid in rows]
+    if len(set(pids)) != len(pids):
+        raise ValueError("Fold metadata must contain unique patient IDs")
+    if len(pids) < n_folds or len(pids) - math.ceil(len(pids) / n_folds) < 2:
+        raise ValueError(
+            f"Cohort of {len(pids)} patients cannot support {n_folds} folds with "
+            "nonempty train, validation and test partitions; use fewer folds "
+            "or more patients."
+        )
+    fold_order = list(range(n_folds))
+    rng.shuffle(fold_order)
+    cursor = 0
     fold_of: dict[str, int] = {}
     for key in sorted(strata):
         pids = sorted(strata[key])
         rng.shuffle(pids)
-        offset = rng.randrange(n_folds)
         for i, pid in enumerate(pids):
-            fold_of[pid] = (i + offset) % n_folds
+            fold_of[pid] = fold_order[(i + cursor) % n_folds]
+        cursor = (cursor + len(pids)) % n_folds
     splits = []
     for k in range(n_folds):
         test = sorted(p for p, f in fold_of.items() if f == k)
-        val: list[str] = []
-        train: list[str] = []
+        rest_by_stratum: dict[str, list[str]] = {}
         for key in sorted(strata):
-            rest = sorted(p for p in strata[key] if p in fold_of and fold_of[p] != k)
+            rest = sorted(p for p in strata[key] if fold_of[p] != k)
             random.Random(f"{seed}-{k}-{key}").shuffle(rest)
-            n_val = round(len(rest) * val_ratio)
-            val += rest[:n_val]
-            train += rest[n_val:]
+            if rest:
+                rest_by_stratum[key] = rest
+        n_rest = sum(len(rows) for rows in rest_by_stratum.values())
+        target = min(max(round(n_rest * val_ratio), 1), n_rest - 1)
+        quotas = {
+            key: len(rows) * target / n_rest for key, rows in rest_by_stratum.items()
+        }
+        allocations = {key: math.floor(quota) for key, quota in quotas.items()}
+        # Seed tie-breaking without biasing equal remainders toward one type.
+        keys = list(rest_by_stratum)
+        random.Random(f"{seed}-{k}-validation").shuffle(keys)
+        keys.sort(key=lambda key: quotas[key] - allocations[key], reverse=True)
+        for key in keys[: target - sum(allocations.values())]:
+            allocations[key] += 1
+        val, train = [], []
+        for key, rows in rest_by_stratum.items():
+            val += rows[: allocations[key]]
+            train += rows[allocations[key] :]
         splits.append(
             PatientListSplit(tuple(sorted(train)), tuple(sorted(val)), tuple(test))
         )
@@ -562,11 +641,15 @@ def plan_folds(
 
 
 def balanced_patients(meta: list[dict[str, Any]], seed: int) -> set[str]:
-    """The paper's balanced dataset: per group, as many stable as converters.
+    """Selects equal stable/converter counts within each visit-history group.
+
+    The larger type is downsampled to the smaller count. Groups missing one
+    type are omitted; no patients are duplicated. Downsampling converters
+    when stable sequences are scarce extends the paper's stable-only rule.
 
     Args:
         meta: One dict per sequence with ``pid``, ``seq_type`` and ``group``.
-        seed: Random seed for choosing which stable sequences to keep.
+        seed: Random seed for downsampling the larger sequence type.
 
     Returns:
         The patient IDs kept.
@@ -583,13 +666,45 @@ def balanced_patients(meta: list[dict[str, Any]], seed: int) -> set[str]:
             m["pid"] for m in meta if m["group"] == group and m["seq_type"] == "stable"
         )
         rng.shuffle(stable)
-        keep.update(conv)
-        keep.update(stable[: len(conv)])
+        count = min(len(conv), len(stable))
+        if len(conv) > count:
+            rng.shuffle(conv)
+        keep.update(conv[:count])
+        keep.update(stable[:count])
     return keep
 
 
+def _balance_report(meta: list[dict[str, Any]], keep: set[str], seed: int) -> dict:
+    """Counts the selected balanced cohort without exposing patient IDs."""
+
+    def counts(rows: list[dict[str, Any]]) -> dict:
+        groups: dict[str, Counter] = {}
+        for row in rows:
+            groups.setdefault(str(row["group"]), Counter())[row["seq_type"]] += 1
+        return {
+            "sequences_by_type": dict(Counter(row["seq_type"] for row in rows)),
+            "sequences_by_group": {
+                key: dict(value) for key, value in sorted(groups.items())
+            },
+        }
+
+    selected = [row for row in meta if row["pid"] in keep]
+    before, after = counts(meta), counts(selected)
+    removed = Counter(before["sequences_by_type"]) - Counter(after["sequences_by_type"])
+    return {
+        "policy_version": BALANCE_POLICY_VERSION,
+        "policy": "per_group_minority_downsampling",
+        "seed": seed,
+        "subjects_before": len(meta),
+        "retained_subjects": len(selected),
+        "removed_by_type": dict(removed),
+        "before": before,
+        "after": after,
+    }
+
+
 # --------------------------------------------------------------------------
-# Metrics (the paper's definitions)
+# Metrics (paper definitions with explicitly documented team conventions)
 # --------------------------------------------------------------------------
 
 
@@ -602,7 +717,11 @@ def hand_till_auc(y: np.ndarray, prob: np.ndarray, classes: Sequence[int]) -> fl
         classes: Class indices to consider.
 
     Returns:
-        The mean pairwise AUC, or NaN if fewer than two classes are present.
+        The mean of both directional rank AUCs for every observed class
+        pair, using the original class scores without pairwise probability
+        renormalization. Ties receive half credit. NaN is returned when
+        fewer than two classes are present. Omitting absent classes is a
+        team convention for subsets where the full multiclass AUC is undefined.
     """
     present = [c for c in classes if np.any(y == c)]
     if len(present) < 2:
@@ -619,12 +738,16 @@ def hand_till_auc(y: np.ndarray, prob: np.ndarray, classes: Sequence[int]) -> fl
 
 
 def subset_metrics(y: np.ndarray, prob: np.ndarray) -> dict[str, float]:
-    """The paper's metrics on one subset of the test sequences.
+    """Evaluates one subset using the paper's Section 2.5 metric definitions.
 
     Sensitivity and specificity are computed one-vs-rest for each of the
-    three classes and averaged over all three; a class with no positives
-    (or no negatives) in the subset contributes 0, as in the paper. BCA is
-    ``(sensitivity + specificity) / 2``.
+    three clinical classes and averaged over all three. By team convention,
+    a sensitivity with no positives or specificity with no negatives
+    contributes 0. BCA is ``(sensitivity + specificity) / 2``. Thus perfect
+    predictions on a converter subset containing MCI and AD, but no CN,
+    yield BCA 5/6 under this convention. Both weighted and macro F1 average
+    only classes present in true labels, with zero-division terms set to 0.
+    These edge cases and F1 averaging are not established author choices.
 
     Args:
         y: True class indices ``[N]`` in ``DX_CLASSES`` order.
@@ -1489,6 +1612,10 @@ def run_fold(
     Returns:
         The fold's metrics, training time and split sizes.
     """
+    if cfg.model != "copy_last" and not all((split.train, split.val, split.test)):
+        raise ValueError(
+            f"{cfg.name} requires nonempty train, validation and test partitions."
+        )
     ctx = ctx or MonthlyContext(dataset, args)
     if cfg.model == "copy_last":
         return run_copy_last_fold(cfg, split, ctx)
@@ -1499,6 +1626,11 @@ def run_fold(
         task_params["imputer"] = ctx.filler(split)
     task = ADProgressionPrediction(**task_params)
     train_ds, val_ds, test_ds = dataset.set_task(task, split=split)
+    if not all(len(part) for part in (train_ds, val_ds, test_ds)):
+        raise ValueError(
+            f"{cfg.name} requires nonempty train, validation and test datasets "
+            "after task processing."
+        )
     torch.manual_seed(args.seed)
     model = build_model(cfg, train_ds)
     trainer = Trainer(
@@ -1679,6 +1811,10 @@ def _experiment_identity(args: argparse.Namespace, source: Path, code: dict) -> 
         "python": platform.python_version(),
         "packages": packages,
         "selection_metric": "balanced_accuracy (macro recall), not paper BCA",
+        "fold_policy_version": FOLD_POLICY_VERSION,
+        "balance_policy_version": BALANCE_POLICY_VERSION,
+        "metric_policy_version": METRIC_POLICY_VERSION,
+        "summary_format_version": SUMMARY_FORMAT_VERSION,
     }
 
 
@@ -1790,10 +1926,10 @@ def flatten(metrics: dict[str, Any], prefix: str = "") -> dict[str, float]:
     return flat
 
 
-# Columns of summary.md, matching the paper's Tables 2-4.
+# Overview metrics for comparison with the paper's Tables 2-5.
 KEY_METRICS = [
     ("overall.mauc", "mAUC"),
-    ("overall.f1_weighted", "F1"),
+    ("overall.f1_weighted", "F1 (weighted)"),
     ("overall.accuracy", "Acc"),
     ("overall.bca", "BCA"),
     ("stable.accuracy", "Stable Acc"),
@@ -1813,6 +1949,22 @@ WELCH_PAIRS = [
 ]
 
 
+def _fold_metric(rows: list[tuple[int, dict[str, float]]], key: str) -> dict[str, Any]:
+    """Summarizes finite fold values and records undefined completed folds."""
+    valid = [
+        (fold, row[key]) for fold, row in rows if key in row and math.isfinite(row[key])
+    ]
+    values = [value for _, value in valid]
+    valid_folds = {fold for fold, _ in valid}
+    return {
+        "values": values,
+        "mean": float(np.mean(values)) if values else float("nan"),
+        "std": float(np.std(values, ddof=0)) if len(values) > 1 else float("nan"),
+        "n_valid": len(values),
+        "undefined_folds": sorted(fold for fold, _ in rows if fold not in valid_folds),
+    }
+
+
 def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
     """Writes summary.csv and summary.md; returns the markdown.
 
@@ -1821,39 +1973,121 @@ def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
         out_dir: Directory to write to.
 
     Returns:
-        The markdown table, followed by Welch's t-tests of the Transformer
-        against the other models of the same experiment (``WELCH_PAIRS``).
+        The markdown table with per-metric finite-fold counts, undefined
+        metric and missing-run coverage, followed by Welch's t-tests when
+        each configuration has at least two finite values (``WELCH_PAIRS``).
     """
     _validate_runs(runs, out_dir)
-    by_name: dict[str, list[dict[str, float]]] = {}
+    by_name: dict[str, list[tuple[int, dict[str, float]]]] = {}
+    groups = {}
     for run in runs:
-        by_name.setdefault(run["config"]["name"], []).append(flatten(run["metrics"]))
-    keys = sorted({k for rows in by_name.values() for row in rows for k in row})
+        name = run["config"]["name"]
+        by_name.setdefault(name, []).append((run["fold"], flatten(run["metrics"])))
+        groups[name] = run["config"].get("group", "reproduce")
+    identity = (
+        json.loads((out_dir / "manifest.json").read_text())["identity"] if runs else {}
+    )
+    settings = identity.get("settings", {})
+    expected = {
+        name: (
+            settings["folds"]
+            if groups[name] in ("reproduce", "paper_setup", "quick")
+            else settings["ablation_folds"]
+        )
+        for name in by_name
+    }
+    missing = {
+        name: sorted(set(range(expected[name])) - {fold for fold, _ in rows})
+        for name, rows in by_name.items()
+    }
+    keys = sorted(
+        {key for rows in by_name.values() for _, row in rows for key in row}
+        | ({key for key, _ in KEY_METRICS} if runs else set())
+    )
+    aggregates = {
+        name: {key: _fold_metric(rows, key) for key in keys}
+        for name, rows in by_name.items()
+    }
     with io.StringIO() as handle:
-        handle.write(
-            "config,folds," + ",".join(f"{k}_mean,{k}_std" for k in keys) + "\n"
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            ["config", "folds", "expected_folds", "missing_folds"]
+            + [
+                f"{key}_{suffix}"
+                for key in keys
+                for suffix in ("mean", "std", "n_valid")
+            ]
         )
         for name, rows in by_name.items():
-            cells = []
-            for k in keys:
-                vals = [r[k] for r in rows if k in r and not math.isnan(r[k])]
+            cells: list[Any] = [
+                name,
+                len(rows),
+                expected[name],
+                json.dumps(missing[name]),
+            ]
+            for key in keys:
+                metric = aggregates[name][key]
                 cells += [
-                    f"{np.mean(vals):.4f}" if vals else "",
-                    f"{np.std(vals):.4f}" if vals else "",
+                    f"{metric['mean']:.4f}" if metric["n_valid"] else "",
+                    f"{metric['std']:.4f}" if metric["n_valid"] > 1 else "",
+                    metric["n_valid"],
                 ]
-            handle.write(f'"{name}",{len(rows)},' + ",".join(cells) + "\n")
+            writer.writerow(cells)
         csv_text = handle.getvalue()
     _write_atomic(out_dir / "summary.csv", csv_text)
-    lines = [
-        "| Config | Folds | " + " | ".join(label for _, label in KEY_METRICS) + " |"
+    lines = (
+        ["Synthetic-data validation; these are not real-data reproduction results.", ""]
+        if identity.get("synthetic")
+        else []
+    )
+    lines += [
+        "Every metric shows finite-value folds n/expected. Missing, NaN and infinite",
+        "values are excluded. SD uses ddof=0 with at least two finite folds;",
+        "NA means that fold-to-fold spread cannot be reported.",
+        "",
+        "| Config | Folds | " + " | ".join(label for _, label in KEY_METRICS) + " |",
     ]
     lines.append("|" + " --- |" * (len(KEY_METRICS) + 2))
     for name, rows in by_name.items():
         cells = []
         for key, _ in KEY_METRICS:
-            vals = [r[key] for r in rows if key in r and not math.isnan(r[key])]
-            cells.append(f"{np.mean(vals):.3f} ± {np.std(vals):.3f}" if vals else "–")
-        lines.append(f"| {name} | {len(rows)} | " + " | ".join(cells) + " |")
+            metric = (
+                aggregates[name][key]
+                if key in aggregates[name]
+                else _fold_metric(rows, key)
+            )
+            coverage = f"n={metric['n_valid']}/{expected[name]}"
+            if metric["n_valid"]:
+                sd = f"{metric['std']:.3f}" if metric["n_valid"] > 1 else "NA"
+                cells.append(f"{metric['mean']:.3f} ± {sd} ({coverage})")
+            else:
+                cells.append(f"– ({coverage})")
+        lines.append(
+            f"| {name} | {len(rows)}/{expected[name]} | " + " | ".join(cells) + " |"
+        )
+    if not runs:
+        lines += ["", "No completed runs."]
+    incomplete = []
+    for name, metrics in aggregates.items():
+        for key, metric in metrics.items():
+            if metric["n_valid"] < expected[name]:
+                incomplete.append(
+                    f"| {name} | {key} | {metric['n_valid']}/{expected[name]} "
+                    f"| {metric['undefined_folds']} | {missing[name]} |"
+                )
+    if incomplete:
+        lines += [
+            "",
+            "Incomplete metric coverage (including metrics available only in CSV):",
+            "",
+            "Undefined completed folds include absent metrics and non-finite values.",
+            "",
+            (
+                "| Config | Metric | Valid/Expected | "
+                "Undefined completed folds | Missing run folds |"
+            ),
+            "| --- | --- | --- | --- | --- |",
+        ] + incomplete
     tests = []
     for data in ("raw", "balanced"):
         for ref_name, others in WELCH_PAIRS:
@@ -1865,35 +2099,38 @@ def summarize(runs: list[dict[str, Any]], out_dir: Path) -> str:
                 for key, label in KEY_METRICS:
                     if key not in TEST_METRICS:
                         continue
-                    a = [r[key] for r in ref if key in r and not math.isnan(r[key])]
-                    b = [r[key] for r in rows if key in r and not math.isnan(r[key])]
+                    a = _fold_metric(ref, key)["values"]
+                    b = _fold_metric(rows, key)["values"]
                     if len(a) > 1 and len(b) > 1:
                         t, p = stats.ttest_ind(a, b, equal_var=False)
+                        defined = math.isfinite(t) and math.isfinite(p)
+                        t_text = f"{t:.2f}" if defined else "NA"
+                        p_text = f"{p:.4f}" if defined else "NA"
+                        n_ref = expected[f"{data}/{ref_name}"]
+                        n_other = expected[f"{data}/{other}"]
                         tests.append(
                             f"| {data} | {ref_name} vs {other} | {label} "
-                            f"| {t:.2f} | {p:.4f} |"
+                            f"| {t_text} | {p_text} | {len(a)}/{n_ref} "
+                            f"| {len(b)}/{n_other} |"
                         )
     if tests:
         lines += [
             "",
             "Welch's t-test across folds:",
             "",
-            "| Data | Comparison | Metric | t | p |",
-            "| --- | --- | --- | --- | --- |",
+            (
+                "| Data | Comparison | Metric | t | p | "
+                "Ref. valid folds | Other valid folds |"
+            ),
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ] + tests
     if runs:
-        manifest = json.loads((out_dir / "manifest.json").read_text())
-        settings = manifest["identity"]["settings"]
         lines += ["", "Fold coverage (partial summaries are not full CV results):", ""]
-        for name in by_name:
-            matching = [r for r in runs if r["config"]["name"] == name]
-            group = matching[0]["config"].get("group", "reproduce")
-            n = settings["folds"] if group in (
-                "reproduce", "paper_setup", "quick"
-            ) else settings["ablation_folds"]
-            present = {r["fold"] for r in matching}
-            missing = sorted(set(range(n)) - present)
-            lines.append(f"- {name}: {len(present)}/{n} folds; missing {missing}")
+        for name, rows in by_name.items():
+            lines.append(
+                f"- {name}: {len(rows)}/{expected[name]} folds; "
+                f"missing {missing[name]}"
+            )
     text = "\n".join(lines) + "\n"
     _write_atomic(out_dir / "summary.md", text)
     return text
@@ -2040,6 +2277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("--fold is outside all selected configurations.")
     done = {r["run_id"] for r in load_runs(runs_path)}
     meta_cache: dict[str, list[dict[str, Any]]] = {}
+    balance_reports: set[str] = set()
     ctx = MonthlyContext(dataset, args)
 
     for cfg in configs:
@@ -2061,6 +2299,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             _write_atomic(out_dir / f"cohort_{name}.json", json.dumps(report, indent=2))
         meta = meta_cache[meta_key]
         keep = balanced_patients(meta, args.seed) if cfg.data == "balanced" else None
+        if keep is not None and meta_key not in balance_reports:
+            report = _balance_report(meta, keep, args.seed)
+            report["source_sha256"] = identity["source_sha256"]
+            name = ("cohort_balanced.json" if json.loads(meta_key)["drop_reverters"]
+                    else "cohort_balanced_keep_reverters.json")
+            _write_atomic(out_dir / name, json.dumps(report, indent=2))
+            balance_reports.add(meta_key)
         splits = plan_folds(meta, n_folds, args.val_ratio, args.seed, keep)
         if args.fold is None:
             folds = range(n_folds)

@@ -266,8 +266,12 @@ class TestTadpoleExperimentProvenance(unittest.TestCase):
             "--only", "raw/visit_transformer", "--epochs", "1",
         ]
         metrics = {"overall": {"bca": .75, "mauc": .8}}
+        # Provenance is the subject of this test; the three-patient fixture
+        # cannot supply nonempty train/validation/test in two-fold CV.
+        split = pipeline.PatientListSplit(("1",), ("2",), ("5",))
         with (
             mock.patch.object(pipeline, "TADPOLEDataset", return_value=self.dataset),
+            mock.patch.object(pipeline, "plan_folds", return_value=[split, split]),
             mock.patch.object(pipeline, "run_fold", return_value=metrics) as train,
             redirect_stdout(io.StringIO()),
         ):

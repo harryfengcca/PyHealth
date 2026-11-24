@@ -43,14 +43,15 @@ diagnosis at its last visit is more severe than at the visit before, and a
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
 from typing import Any, ClassVar
 
 import torch
 
+from ..processors import MultiClassLabelProcessor
 from .base_task import BaseTask
 
 #: The 22 numeric features per visit, in model input order.
@@ -389,6 +390,8 @@ class ADProgressionPrediction(BaseTask):
       The dataloader pads it with False, preserving real visits even if all
       their features become zero after normalization and imputation.
     * ``label``: the diagnosis at the target visit, ``CN``, ``MCI`` or ``AD``.
+      The label processor always uses this class order (indices 0, 1 and 2),
+      including when a small training split lacks one of the diagnoses.
     * ``seq_type``: ``"stable"``, ``"converter"`` or ``"reverter"``.
     * ``group``: the number of input visits ``n`` (the paper's group).
     * ``last_dx``: the diagnosis at the last input visit.
@@ -435,7 +438,9 @@ class ADProgressionPrediction(BaseTask):
             {"normalization": "zscore", "impute_strategy": "zero"},
         )
     }
-    output_schema: ClassVar[dict[str, Any]] = {"label": "multiclass"}
+    output_schema: ClassVar[dict[str, Any]] = {
+        "label": (MultiClassLabelProcessor, {"labels": list(DX_CLASSES)})
+    }
 
     def __init__(
         self,
@@ -459,6 +464,10 @@ class ADProgressionPrediction(BaseTask):
         # Include the sample-layout version in BaseDataset's task cache key.
         self._visit_mask_version = 1
         self._sequence_policy_version = SEQUENCE_POLICY_VERSION
+        # Keep a fixed output space even when a small training fold lacks a class.
+        self._label_schema_version = 2
+        # Reject caches built when zero imputation concealed infinite values.
+        self._finite_values_version = 1
         self.input_schema = {
             "visits": (
                 "tensor",
@@ -469,7 +478,9 @@ class ADProgressionPrediction(BaseTask):
                 },
             )
         }
-        self.output_schema = {"label": "multiclass"}
+        self.output_schema = {
+            "label": (MultiClassLabelProcessor, {"labels": list(DX_CLASSES)})
+        }
         super().__init__()
 
     @property

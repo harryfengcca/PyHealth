@@ -161,7 +161,9 @@ class TestRuleFunctions(unittest.TestCase):
         _, options = task.input_schema["visits"]
         self.assertTrue(options["missing_indicators"])
         self.assertIsNone(options["normalization"])
-        self.assertEqual(task.output_schema, {"label": "multiclass"})
+        label_processor, label_options = task.output_schema["label"]
+        self.assertEqual(label_processor.mode, "multiclass")
+        self.assertEqual(label_options, {"labels": list(DX_CLASSES)})
         self.assertEqual(ADProgressionPrediction().num_features, 26)
         self.assertEqual(ADProgressionPrediction(time_feature="none").num_features, 25)
 

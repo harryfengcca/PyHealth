@@ -8,6 +8,12 @@ pads this mask with False; ``VisitTransformer`` and PyHealth's ``RNN`` use it
 to distinguish real visits from padding even when normalized features are zero.
 Existing task caches are rebuilt for this sample layout.
 
+The multiclass processor has a fixed output vocabulary: ``CN=0``, ``MCI=1``
+and ``AD=2``. All three outputs remain available when a small training fold
+lacks a diagnosis class. This uses the predefined clinical label space rather
+than validation/test labels; feature statistics are still fitted on training
+patients only. The label-schema cache version changes for this representation.
+
 Sequence policy version 2 checks both explicit transition strings and observed
 stage decreases for reversions before truncating at the first conversion.
 Visit preparation is shared by the task, experiment audit, and monthly baselines.
