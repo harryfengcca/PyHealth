@@ -1,17 +1,16 @@
 import math
 from collections.abc import Iterable
-from itertools import chain
 from typing import Any, Literal
 
 import torch
 
 from . import register_processor
-from .base_processor import FeatureProcessor
+from .base_processor import LegacyFeatureProcessor
 from .utils import NORMALIZATIONS, Normalization, fit_normalization
 
 
 @register_processor("tensor")
-class TensorProcessor(FeatureProcessor):
+class TensorProcessor(LegacyFeatureProcessor):
     """
     Feature processor for converting numerical lists to tensors.
 
@@ -47,6 +46,10 @@ class TensorProcessor(FeatureProcessor):
     normalization: Normalization = None
     missing_indicators: bool = False
     impute_strategy: Literal["zero"] | None = None
+    _shape: tuple[int | None, ...] | None = None
+    """The input shape seen in ``fit()``, with None for the first axis when
+    its length varies between samples; None if unknown (not fitted, fitted
+    before this was recorded, or other axes varying)."""
 
     def __init__(
         self,
@@ -78,6 +81,7 @@ class TensorProcessor(FeatureProcessor):
         self.dtype = dtype
         self._n_dim = None
         self._feature_dim = None
+        self._shape = None
         self._spatial_dims = spatial_dims
         self.normalization = normalization
         self.missing_indicators = missing_indicators
@@ -89,6 +93,8 @@ class TensorProcessor(FeatureProcessor):
     def fit(self, samples: Iterable[dict[str, Any]], field: str) -> None:
         """Infer n_dim and the feature width from the first valid sample.
 
+        Also records the input shape over all samples (see :attr:`_shape`).
+
         Args:
             samples: Iterable of sample dictionaries.
             field: The field name to extract from samples.
@@ -97,38 +103,53 @@ class TensorProcessor(FeatureProcessor):
             ValueError: If normalization training values contain infinity,
                 or the fitted center or scale is non-finite.
         """
-        sample_iterator = iter(samples)
-        first_sample = None
-        for sample in sample_iterator:
-            if field in sample and sample[field] is not None:
-                value = sample[field]
-                tensor = (
-                    value.detach().clone()
-                    if isinstance(value, torch.Tensor)
-                    else torch.tensor(value, dtype=self.dtype)
-                )
-                self._n_dim = tensor.dim()
-                self._feature_dim = tensor.shape[-1] if tensor.dim() > 0 else 1
-                first_sample = sample
-                break
+        first: tuple[int, ...] | None = None
+        consistent, first_axis_varies = True, False
 
+        def observed_values() -> Iterable[Any]:
+            """Yields each non-missing value once, recording shapes on the way.
+
+            A single pass, so one-shot iterators feed both the shape record
+            and the normalization statistics.
+            """
+            nonlocal first, consistent, first_axis_varies
+            for sample in samples:
+                value = sample.get(field)
+                if value is None:
+                    continue
+                shape = tuple(
+                    value.shape
+                    if isinstance(value, torch.Tensor)
+                    else torch.tensor(value, dtype=self.dtype).shape
+                )
+                if first is None:
+                    first = shape
+                    self._n_dim = len(shape)
+                    self._feature_dim = shape[-1] if shape else 1
+                elif len(shape) != len(first) or shape[1:] != first[1:]:
+                    consistent = False
+                elif shape[:1] != first[:1]:
+                    first_axis_varies = True
+                yield value
+
+        values = observed_values()
         if self.normalization is not None:
-            # Include the sample used for shape inference in one-pass streams.
-            fit_samples = chain(
-                () if first_sample is None else (first_sample,), sample_iterator
-            )
             self.center, self.scale = fit_normalization(
-                (
-                    self._normalization_input(sample[field]).numpy()
-                    for sample in fit_samples
-                    if sample.get(field) is not None
-                ),
+                (self._normalization_input(value).numpy() for value in values),
                 self.normalization,
             )
             if not all(math.isfinite(value) for value in self.center + self.scale):
                 raise ValueError(
                     "TensorProcessor fitted non-finite normalization statistics"
                 )
+        else:
+            for _ in values:
+                pass
+        self._shape = (
+            None
+            if first is None or not consistent
+            else ((None, *first[1:]) if first_axis_varies else first)
+        )
 
     def _normalization_input(self, value: Any) -> torch.Tensor:
         """Checks a training value before it contributes to fitted statistics.
