@@ -1,0 +1,50 @@
+{
+  "experiment_id": "28fcef80350abc2658940e55ee217e7cdb6e5ff3605022deb3858bf9825a454d",
+  "identity": {
+    "balance_policy_version": 2,
+    "code": {
+      "git_revision": "ba5eac64c4c24dae4a45f1c28b235712ff580c61",
+      "source_sha256": "5b760223e890511a091e8c61c16fe922d782daee1fd3282b61e4c5e1cea36c90"
+    },
+    "fold_policy_version": 2,
+    "metric_policy_version": 1,
+    "packages": {
+      "dask": "2026.11.0",
+      "distributed": "2026.11.0",
+      "litdata": "0.2.76",
+      "narwhals": "2.29.0",
+      "numpy": "2.3.5",
+      "pandas": "2.2.3",
+      "peft": "0.22.0",
+      "polars": "1.35.2",
+      "pyarrow": "26.0.1",
+      "pydantic": "2.14.3",
+      "pyhealth": null,
+      "scikit-learn": "1.9.1",
+      "scipy": "1.18.1",
+      "torch": "2.15.0",
+      "torchvision": "0.29.2",
+      "transformers": "5.24.0"
+    },
+    "python": "3.12.14",
+    "schema_version": 1,
+    "selection_metric": "balanced_accuracy (macro recall), not paper BCA",
+    "settings": {
+      "ablation_folds": 2,
+      "batch_size": 32,
+      "device": "cpu",
+      "epochs": 2,
+      "experiment": "quick",
+      "folds": 2,
+      "lr": 0.0001,
+      "monthly_epochs": 2,
+      "patience": 20,
+      "seed": 42,
+      "val_ratio": 0.15,
+      "weight_decay": 1e-05
+    },
+    "source_sha256": "4cb45b9648916be2204db9042dee2dc344294d23dc6c55e93ca6ecd24acbb6d0",
+    "summary_format_version": 2,
+    "synthetic": true
+  }
+}

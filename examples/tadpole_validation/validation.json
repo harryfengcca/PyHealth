@@ -1,0 +1,90 @@
+{
+  "scope": "Processor-to-loader-to-model validation of the retained team architecture",
+  "code_identity": {
+    "source_sha256": "5b760223e890511a091e8c61c16fe922d782daee1fd3282b61e4c5e1cea36c90",
+    "git_revision": "ba5eac64c4c24dae4a45f1c28b235712ff580c61"
+  },
+  "historical_results_preserved": true,
+  "historical_results_sha256": "9d61737b8c78558b2420496cb425d7c8e5ab3400d6d069e4e9f4f1df4368e6c7",
+  "focused_tests_passed": 223,
+  "focused_tests_seconds": 2.184,
+  "model_tests_passed": 34,
+  "new_boundary_regression_tests": 3,
+  "pipeline_regression_tests_passed": 8,
+  "doctests_passed": 44,
+  "test_modules": [
+    "test_tadpole.py",
+    "test_ad_progression.py",
+    "test_tadpole_experiments.py",
+    "test_tadpole_splits.py",
+    "test_tadpole_metrics.py",
+    "test_visit_transformer.py",
+    "test_rnn.py",
+    "test_tensor_processor_nonfinite.py",
+    "test_processor_normalization.py",
+    "test_sample_dataset.py",
+    "test_sample_builder.py",
+    "test_processor_schemas.py",
+    "test_processor_transfer.py",
+    "test_partial_processors.py"
+  ],
+  "ruff_and_pep8_passed": true,
+  "black_model_and_tests_passed": true,
+  "sphinx_model_task_processor_api_build_passed": true,
+  "experiments": [
+    {
+      "experiment": "quick",
+      "experiment_id": "28fcef80350abc2658940e55ee217e7cdb6e5ff3605022deb3858bf9825a454d",
+      "synthetic": true,
+      "runs": 14,
+      "configurations": 7,
+      "folds_per_configuration": 2,
+      "epochs": 2,
+      "metric_aggregates_verified": 343,
+      "artifact_sha256": {
+        "manifest.json": "db29c41e54a021536543b5a2b25852f4b5d5857f06ce1dc96e954e0585b3fc27",
+        "runs.jsonl": "fc089f45be5f300751ea400c4eca348d6029f86234ca9635ea0b269fbd7c470a",
+        "summary.csv": "6f7b1e839abee041c97341b64be48f4386445b8ebf9c56ba0fca0a49c74dd362",
+        "summary.md": "39597feafa5d46c6a55453767c0073a4fdb99a4db06160a9a391228e33289882",
+        "cohort_default.json": "40368fc62fd1480103ccb3583ef60720987e702ed46fc03268f1fe9f64f582de",
+        "cohort_balanced.json": "586e9cea6f6e32853d3d616e962502a303aaf2fc26991fb86af7ef60c6af180e"
+      }
+    },
+    {
+      "experiment": "model_ablation",
+      "experiment_id": "a7e3f8474f9facb5d7ba5df7ef4947f63460ba8cb9a3a2fc4d18333f8a8affd2",
+      "synthetic": true,
+      "runs": 18,
+      "configurations": 9,
+      "folds_per_configuration": 2,
+      "epochs": 2,
+      "metric_aggregates_verified": 441,
+      "artifact_sha256": {
+        "manifest.json": "aa7375a89e1a7750c41e81cfcf13129e43171d14ec95919e5541bf7045076f3c",
+        "runs.jsonl": "3d6bfc75a091b2029fdae1321946eae19cefc83b9de5474f0fa8f6ae2ec5277c",
+        "summary.csv": "cd87af6f902a4dec1230785c5f5383d622f4d1c96004663127ce236081d2e4fb",
+        "summary.md": "391feb9fd34b4ef2530c31d7f295c8657291281d83b30d48235f8d112626cbc7",
+        "cohort_default.json": "40368fc62fd1480103ccb3583ef60720987e702ed46fc03268f1fe9f64f582de"
+      }
+    },
+    {
+      "experiment": "paper_setup",
+      "experiment_id": "616c43c5bfb6e055407d988767272678d42dcb7897959926c68842c10e7f9b51",
+      "synthetic": true,
+      "runs": 24,
+      "configurations": 12,
+      "folds_per_configuration": 2,
+      "epochs": 2,
+      "metric_aggregates_verified": 588,
+      "artifact_sha256": {
+        "manifest.json": "ce741aacf784a0ec57296dccfe6bc0c1b3690aa2a7859ceeef90bff4a2ef3385",
+        "runs.jsonl": "e56a7bead86b0050acad9975efc8d68b276ea1ee34e16a683a6ae3289866cdfe",
+        "summary.csv": "96ea6a46c9520004f44e6455e14fc37866919176d035b16f622a6ed700f72711",
+        "summary.md": "ed739791750b14a5cb7b0bfbc7fe0c7965934b0becf0f586d7fed6f52994e7db",
+        "cohort_default.json": "40368fc62fd1480103ccb3583ef60720987e702ed46fc03268f1fe9f64f582de",
+        "cohort_balanced.json": "586e9cea6f6e32853d3d616e962502a303aaf2fc26991fb86af7ef60c6af180e"
+      }
+    }
+  ],
+  "limitation": "40 generated subjects, 2 folds, 2 epochs; no real-data performance claim."
+}
