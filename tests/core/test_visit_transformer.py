@@ -19,6 +19,7 @@ dataset, so no files are written. Models are tiny and seeded, so every test
 runs in milliseconds and gives the same result on every run.
 """
 
+import copy
 import io
 import unittest
 from unittest import mock
@@ -27,6 +28,7 @@ import torch
 
 from pyhealth.datasets import create_sample_dataset, get_dataloader
 from pyhealth.models import VisitTransformer
+from pyhealth.models.visit_transformer import _BatchNormEncoderLayer
 from pyhealth.processors import MultiClassLabelProcessor
 from pyhealth.trainer import Trainer
 
@@ -225,7 +227,7 @@ class TestVisitTransformer(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["loss"]))
 
     def test_encoder_decoder_output(self) -> None:
-        """The paper's encoder-decoder gives one prediction per sequence."""
+        """The encoder-decoder variant gives one prediction per sequence."""
         model = self._model(architecture="encoder_decoder", num_decoder_layers=1)
         out = model(**self.batch)
         self.assertEqual(tuple(out["logit"].shape), (6, 3))
@@ -234,6 +236,22 @@ class TestVisitTransformer(unittest.TestCase):
         """``embed=True`` also returns the pooled sequence embedding."""
         out = self._model()(**self.batch, embed=True)
         self.assertEqual(tuple(out["embed"].shape), (6, 16))
+
+    def test_tensor_tuple_input_and_boolean_embed_flag(self) -> None:
+        """The annotated tuple input and bool flag follow the tensor contract."""
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            with self.subTest(architecture=arch):
+                model = self._model(
+                    architecture=arch, num_decoder_layers=1, max_visits=4
+                ).eval()
+                wrapped = {**self.batch, "visits": (self.batch["visits"],)}
+                with torch.no_grad():
+                    direct = model(**self.batch, embed=True)
+                    actual = model(**wrapped, embed=True)
+                    plain = model(**wrapped, embed=False)
+                for key in ("logit", "y_prob", "y_true", "loss", "embed"):
+                    torch.testing.assert_close(actual[key], direct[key])
+                self.assertNotIn("embed", plain)
 
     def test_losses(self) -> None:
         """Weighted cross-entropy and focal loss run; bad weights are rejected."""
@@ -260,16 +278,18 @@ class TestVisitTransformer(unittest.TestCase):
                     ).eval()
                     with torch.no_grad():
                         actual = model.encode(batch)
-                        expected = torch.cat([
-                            model.encode(short[:, -limit:]),
-                            model.encode(long[:, -limit:]),
-                        ])
+                        expected = torch.cat(
+                            [
+                                model.encode(short[:, -limit:]),
+                                model.encode(long[:, -limit:]),
+                            ]
+                        )
                     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
     def test_explicit_mask_preserves_zero_visits(self) -> None:
         """Explicit validity retains real zero rows and ignores masked garbage."""
-        x = torch.tensor([[[1., 2., 3., 4., 5.], [0., 0., 0., 0., 0.]]])
-        padded = torch.cat([x, torch.full((1, 3, 5), 99.)], dim=1)
+        x = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0], [0.0, 0.0, 0.0, 0.0, 0.0]]])
+        padded = torch.cat([x, torch.full((1, 3, 5), 99.0)], dim=1)
         mask = torch.tensor([[True, True, False, False, False]])
         for arch in ("encoder", "encoder_decoder", "tst"):
             with self.subTest(architecture=arch):
@@ -295,11 +315,11 @@ class TestVisitTransformer(unittest.TestCase):
                 out = model(visits=x, visits_mask=mask, label=torch.tensor([0, 1]))
                 out["loss"].backward()
                 self.assertTrue(torch.isfinite(x.grad).all())
-                self.assertEqual(x.grad[0, 0].abs().sum().item(), 0.)
-                self.assertEqual(x.grad[0, 2:].abs().sum().item(), 0.)
-                self.assertEqual(x.grad[1, :3].abs().sum().item(), 0.)
-                self.assertGreater(x.grad[0, 1].abs().sum().item(), 0.)
-                self.assertGreater(x.grad[1, 3].abs().sum().item(), 0.)
+                self.assertEqual(x.grad[0, 0].abs().sum().item(), 0.0)
+                self.assertEqual(x.grad[0, 2:].abs().sum().item(), 0.0)
+                self.assertEqual(x.grad[1, :3].abs().sum().item(), 0.0)
+                self.assertGreater(x.grad[0, 1].abs().sum().item(), 0.0)
+                self.assertGreater(x.grad[1, 3].abs().sum().item(), 0.0)
 
     def test_visit_mask_validation_and_empty_fallback(self) -> None:
         """Reject malformed masks and keep all-padding samples finite."""
@@ -316,6 +336,64 @@ class TestVisitTransformer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_visits must be positive"):
             self._model(max_visits=0)
 
+    def test_infinite_retained_visits_are_rejected(self) -> None:
+        """Both public entry points reject infinity before attention or BN."""
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            model = self._model(architecture=arch, num_decoder_layers=1, max_visits=2)
+            for value in (float("inf"), -float("inf")):
+                x = torch.ones(1, 2, 5)
+                x[0, 1, 0] = value
+                for entry in ("forward", "encode"):
+                    with (
+                        self.subTest(architecture=arch, value=value, entry=entry),
+                        self.assertRaisesRegex(ValueError, "infinite"),
+                    ):
+                        if entry == "forward":
+                            model(visits=x, label=torch.tensor([0]))
+                        else:
+                            model.encode(x)
+
+    def test_infinity_in_masked_or_discarded_visits_is_ignored(self) -> None:
+        """Validation follows masking and history truncation for all models."""
+        x = torch.tensor(
+            [[[float("inf")] * 5, [0.1] * 5, [0.2] * 5, [-float("inf")] * 5]]
+        )
+        mask = torch.tensor([[True, True, True, False]])
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            model = self._model(
+                architecture=arch, num_decoder_layers=1, max_visits=2
+            ).eval()
+            with self.subTest(architecture=arch), torch.no_grad():
+                actual = model(visits=x, visits_mask=mask)["logit"]
+                expected = model(visits=x[:, 1:3])["logit"]
+                torch.testing.assert_close(actual, expected)
+                self.assertTrue(torch.isfinite(actual).all())
+
+    def test_nan_features_match_zero_imputation_and_finite_gradients(self) -> None:
+        """NaN remains supported through encode and forward, with explicit masks."""
+        missing = torch.tensor(
+            [[[float("nan")] * 5, [0.1, float("nan"), 0.3, 0.4, 0.5]]]
+        )
+        observed = torch.where(torch.isnan(missing), 0.0, missing)
+        mask = torch.ones(1, 2, dtype=torch.bool)
+        for arch in ("encoder", "encoder_decoder", "tst"):
+            model = self._model(
+                architecture=arch, num_decoder_layers=1, max_visits=2
+            ).eval()
+            with self.subTest(architecture=arch):
+                x = missing.clone().requires_grad_()
+                expected = model.encode(observed, mask)
+                actual = model.encode(x, mask)
+                torch.testing.assert_close(actual, expected)
+                result = model(
+                    visits=x, visits_mask=mask, label=torch.tensor([0]), embed=True
+                )
+                torch.testing.assert_close(result["embed"], actual)
+                self.assertTrue(torch.isfinite(result["loss"]))
+                result["loss"].backward()
+                self.assertTrue(torch.isfinite(x.grad).all())
+                self.assertEqual(x.grad[torch.isnan(missing)].abs().sum().item(), 0.0)
+
     def test_long_sequences_are_truncated(self) -> None:
         """Inputs longer than ``max_visits`` keep the most recent visits."""
         model = self._model(max_visits=2).eval()
@@ -331,6 +409,220 @@ class TestVisitTransformer(unittest.TestCase):
             self._model(architecture="lstm")
         with self.assertRaises(ValueError):
             self._model(loss="hinge")
+
+    def test_positive_integer_dimensions(self) -> None:
+        """Invalid dimensions fail at construction with a descriptive error."""
+        for name in (
+            "embedding_dim",
+            "num_heads",
+            "num_layers",
+            "num_decoder_layers",
+            "feedforward_dim",
+            "max_visits",
+        ):
+            for value in (0, -1, 1.5, True):
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(ValueError, name),
+                ):
+                    self._model(architecture="encoder_decoder", **{name: value})
+
+    def test_finite_dropout_and_focal_gamma(self) -> None:
+        """Dropout and focal gamma are validated before modules are built."""
+        invalid = {
+            "dropout": (-0.1, 1.1, float("nan"), float("inf"), "bad", True),
+            "focal_gamma": (-1.0, float("nan"), float("inf"), "bad", True),
+        }
+        for name, values in invalid.items():
+            for value in values:
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(ValueError, name),
+                ):
+                    self._model(**{name: value})
+
+    def test_class_weights_require_finite_positive_vector(self) -> None:
+        """Bad weights never reach cross-entropy or focal loss."""
+        invalid = (
+            1.0,
+            [[1.0, 1.0, 1.0]],
+            [1.0, 2.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+            [float("nan"), 1.0, 1.0],
+            [float("inf"), 1.0, 1.0],
+        )
+        for loss in ("ce", "weighted_ce", "focal"):
+            for weights in invalid:
+                with (
+                    self.subTest(loss=loss, weights=weights),
+                    self.assertRaisesRegex(ValueError, "class_weights"),
+                ):
+                    self._model(loss=loss, class_weights=weights)
+
+    def test_losses_match_manual_values_and_gradients(self) -> None:
+        """Explicit weights use weighted CE or the batch mean of focal terms."""
+        targets = torch.tensor([0, 1, 2, 1])
+        scores = torch.tensor(
+            [[2.0, 0.0, -1.0], [1.0, 3.0, 0.0], [0.0, 1.0, 2.0], [2.0, 1.0, 0.0]]
+        )
+        weights = torch.tensor([1.0, 2.0, 4.0])
+        for loss in ("ce", "weighted_ce", "focal"):
+            with self.subTest(loss=loss):
+                model = self._model(loss=loss, class_weights=weights.tolist())
+                logits = scores.clone().requires_grad_()
+                reference = scores.clone().requires_grad_()
+                actual = model._compute_loss(logits, targets)
+                pt = reference.softmax(-1)[torch.arange(4), targets]
+                terms = -pt.log() * weights[targets]
+                if loss == "focal":
+                    expected = ((1 - pt).square() * terms).mean()
+                else:
+                    expected = terms.sum() / weights[targets].sum()
+                torch.testing.assert_close(actual, expected)
+                actual.backward()
+                expected.backward()
+                torch.testing.assert_close(logits.grad, reference.grad)
+
+    def test_automatic_weights_on_imbalanced_labels(self) -> None:
+        """Inverse frequencies respect the label vocabulary's class order."""
+        samples = _samples()
+        labels = ["CN", "CN", "CN", "MCI", "MCI", "AD"]
+        for sample, label in zip(samples, labels):
+            sample["label"] = label
+        dataset = create_sample_dataset(
+            samples,
+            input_schema={"visits": "tensor"},
+            output_schema={"label": "multiclass"},
+        )
+        model = VisitTransformer(dataset, loss="weighted_ce", **SMALL)
+        expected = torch.empty(3)
+        for label, index in dataset.output_processors["label"].label_vocab.items():
+            expected[index] = 6 / (3 * labels.count(label))
+        torch.testing.assert_close(model.class_weights, expected)
+
+    def test_focal_loss_handles_confident_predictions(self) -> None:
+        """Zero and fractional gamma keep extreme-score gradients finite."""
+        for gamma in (0.0, 0.5, 2.0):
+            with self.subTest(gamma=gamma):
+                model = self._model(loss="focal", focal_gamma=gamma)
+                logits = torch.tensor(
+                    [[1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0]],
+                    requires_grad=True,
+                )
+                targets = torch.tensor([0, 2])
+                loss = model._compute_loss(logits, targets)
+                self.assertTrue(torch.isfinite(loss))
+                if gamma == 0:
+                    torch.testing.assert_close(
+                        loss, torch.nn.functional.cross_entropy(logits, targets)
+                    )
+                loss.backward()
+                self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_transformer_layers_have_independent_seeded_initialization(self) -> None:
+        """Cloned layers get different weights; a repeated seed reproduces them."""
+        for arch in ("encoder", "encoder_decoder"):
+            with self.subTest(architecture=arch):
+                params = {
+                    "architecture": arch,
+                    "num_layers": 2,
+                    "num_decoder_layers": 2,
+                }
+                model = self._model(**params)
+                repeated = self._model(**params)
+                for name, value in model.state_dict().items():
+                    self.assertTrue(
+                        torch.equal(value, repeated.state_dict()[name]), name
+                    )
+                stacks = [model.encoder]
+                if arch == "encoder_decoder":
+                    stacks.append(model.decoder)
+                for stack in stacks:
+                    first, second = stack.layers
+                    for a, b in (
+                        (
+                            first.self_attn.in_proj_weight,
+                            second.self_attn.in_proj_weight,
+                        ),
+                        (first.linear1.weight, second.linear1.weight),
+                    ):
+                        self.assertIsNot(a, b)
+                        self.assertFalse(torch.equal(a, b))
+                for module in model.modules():
+                    if isinstance(module, torch.nn.LayerNorm):
+                        torch.testing.assert_close(
+                            module.weight, torch.ones_like(module.weight)
+                        )
+                        torch.testing.assert_close(
+                            module.bias, torch.zeros_like(module.bias)
+                        )
+
+    def test_tst_training_ignores_padding_in_normalization(self) -> None:
+        """Masked padding cannot change real outputs, gradients or BN statistics."""
+        torch.manual_seed(9)
+        layer = _BatchNormEncoderLayer(16, 2, 32, 0.0)
+        padded_layer = copy.deepcopy(layer)
+        mask = torch.tensor([[False, False, True], [False, False, False]])
+        x = torch.randn(2, 3, 16, requires_grad=True)
+        padded = torch.cat([x.detach(), torch.full((2, 4, 16), 99.0)], dim=1)
+        padded.requires_grad_()
+        padded_mask = torch.nn.functional.pad(mask, (0, 4), value=True)
+        actual = layer(x, mask)
+        extended = padded_layer(padded, padded_mask)
+        torch.testing.assert_close(actual[~mask], extended[~padded_mask])
+        self.assertEqual(extended[padded_mask].abs().sum().item(), 0.0)
+        for a, b in (
+            (layer.norm1, padded_layer.norm1),
+            (layer.norm2, padded_layer.norm2),
+        ):
+            torch.testing.assert_close(a.running_mean, b.running_mean)
+            torch.testing.assert_close(a.running_var, b.running_var)
+            self.assertEqual(a.num_batches_tracked.item(), 1)
+            self.assertEqual(b.num_batches_tracked.item(), 1)
+        target = torch.randn_like(actual[~mask])
+        (actual[~mask] * target).sum().backward()
+        (extended[~padded_mask] * target).sum().backward()
+        torch.testing.assert_close(x.grad[~mask], padded.grad[~padded_mask])
+        self.assertEqual(x.grad[mask].abs().sum().item(), 0.0)
+        self.assertEqual(padded.grad[padded_mask].abs().sum().item(), 0.0)
+        for a, b in zip(layer.parameters(), padded_layer.parameters()):
+            self.assertTrue(torch.isfinite(a.grad).all())
+            torch.testing.assert_close(a.grad, b.grad, atol=1e-5, rtol=1e-5)
+
+    def test_tst_single_valid_visit_trains_without_updating_statistics(self) -> None:
+        """Singleton training uses stored BN statistics and retains gradients."""
+        for loss in ("ce", "weighted_ce", "focal"):
+            with self.subTest(loss=loss):
+                model = self._model(architecture="tst", max_visits=1, loss=loss)
+                with torch.no_grad():
+                    model(**self.batch)
+                norms = (model.tst_layers[0].norm1, model.tst_layers[0].norm2)
+                before = [copy.deepcopy(norm.state_dict()) for norm in norms]
+                x = torch.randn(1, 1, 5, requires_grad=True)
+                result = model(visits=x, label=torch.tensor([0]))
+                self.assertTrue(torch.isfinite(result["loss"]))
+                result["loss"].backward()
+                self.assertTrue(torch.isfinite(x.grad).all())
+                for name, param in model.named_parameters():
+                    if name != "_dummy_param":
+                        self.assertIsNotNone(param.grad, name)
+                        self.assertTrue(torch.isfinite(param.grad).all(), name)
+                for norm, state in zip(norms, before):
+                    for key, value in norm.state_dict().items():
+                        torch.testing.assert_close(value, state[key])
+
+    def test_tst_all_padding_singleton_has_finite_training_loss(self) -> None:
+        """The empty-history fallback also works with one training sample."""
+        model = self._model(architecture="tst", max_visits=1)
+        result = model(
+            visits=torch.zeros(1, 2, 5),
+            visits_mask=torch.zeros(1, 2, dtype=torch.bool),
+            label=torch.tensor([0]),
+        )
+        self.assertTrue(torch.isfinite(result["loss"]))
+        result["loss"].backward()
 
 
 if __name__ == "__main__":

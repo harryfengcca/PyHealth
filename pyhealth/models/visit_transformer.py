@@ -14,9 +14,10 @@ Paper:
 Description:
     Visit-level Transformer for multiclass next-visit diagnosis prediction.
 
-Implements the model of Moghaddami, Schubring and Siadat, "Transformer Model
-for Alzheimer's Disease Progression Prediction Using Longitudinal Visit
-Sequences" (CHIL 2025, https://proceedings.mlr.press/v287/moghaddami25a.html).
+Implements a reproduction attempt of Moghaddami, Schubring and Siadat,
+"Transformer Model for Alzheimer's Disease Progression Prediction Using
+Longitudinal Visit Sequences" (CHIL 2025,
+https://proceedings.mlr.press/v287/moghaddami25a.html).
 
 Each clinical visit is one token: a dense vector of measurements, the current
 diagnosis and a time feature. Self-attention lets every visit attend to every
@@ -29,17 +30,31 @@ order of visits is invisible to it), infers the padding mask after a biased
 linear projection (so padded visits take part in attention) and represents
 a sequence by its first, i.e. oldest, visit. This model masks padded visits
 out of attention and pooling, adds learned position embeddings, and
-summarizes a sequence by masked mean pooling or, as in the paper, by a
-decoder query. It also offers the class-weighted and focal losses used in
+summarizes a sequence by masked mean pooling or by a learned decoder query.
+The query is a team implementation assumption, not a detail established by
+the paper. It also offers the class-weighted and focal losses used in
 our ablations, and the Time Series Transformer (TST) of Zerveas et al.
 (KDD 2021), the paper's second Transformer baseline.
 
 Shapes use the row-vector convention, ``Y = X @ W``:
 ``[B, T, F] @ [F, d] -> [B, T, d]``, then ``[B, d] @ [d, C] -> [B, C]``.
+
+Reproduction boundary:
+    The paper reports 4 encoder layers, 8 decoder layers, 4 attention heads,
+    width 256 and 6,603,267 parameters. ``encoder_decoder`` can match those
+    reported dimensions, but its learned query, learned positions, pre-norm
+    blocks, final layer norms and feed-forward width are team choices whose
+    equivalence to the authors' implementation has not been established.
+    With 26 input columns, 3 classes, ``max_visits=64`` and feed-forward width
+    512, that configuration has 8,460,035 parameters. The default smaller
+    encoder is a team variant. TST uses validity-aware batch normalization
+    and a singleton fallback, both team adaptations for padded batches.
 """
 
 import math
 from collections.abc import Sequence
+from numbers import Integral, Real
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -53,7 +68,15 @@ LOSSES = ("ce", "weighted_ce", "focal")
 
 
 def _sinusoidal_positions(length: int, dim: int) -> torch.Tensor:
-    """Fixed sine/cosine position encodings ``[length, dim]``."""
+    """Builds fixed sine/cosine position encodings.
+
+    Args:
+        length: Number of positions.
+        dim: Embedding width, including an unpaired sine channel when odd.
+
+    Returns:
+        A float32 CPU tensor of shape ``[length, dim]``.
+    """
     position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
     freq = torch.exp(
         torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
@@ -69,7 +92,11 @@ class _BatchNormEncoderLayer(nn.Module):
 
     Follows ``TransformerBatchNormEncoderLayer`` of Zerveas et al. (2021):
     self-attention and a GELU feed-forward block, each followed by a residual
-    connection and ``BatchNorm1d`` over the embedding channels.
+    connection and batch normalization over the embedding channels. Only
+    valid visits contribute to normalization statistics. A training batch
+    with one valid visit uses running statistics without updating them;
+    its affine parameters and input still receive gradients. These are team
+    adaptations of the TST baseline, not verified choices from the paper.
 
     Args:
         d_model: Embedding width ``d``.
@@ -94,14 +121,57 @@ class _BatchNormEncoderLayer(nn.Module):
         self.norm2 = nn.BatchNorm1d(d_model)
 
     def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        """Encodes ``x`` ``[B, T, d]``; ``padding_mask`` ``[B, T]`` marks padding."""
+        """Applies attention and feed-forward blocks with masked normalization.
+
+        Args:
+            x: Hidden states ``[B, T, d]`` with at least one valid visit.
+            padding_mask: Boolean ``[B, T]``; True marks padding.
+
+        Returns:
+            Hidden states ``[B, T, d]``, with padded positions set to zero.
+        """
+        x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         attended, _ = self.self_attn(
             x, x, x, key_padding_mask=padding_mask, need_weights=False
         )
         x = x + self.dropout1(attended)
-        x = self.norm1(x.transpose(1, 2)).transpose(1, 2)
+        x = self._masked_norm(x, padding_mask, self.norm1)
         x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(x)))))
-        return self.norm2(x.transpose(1, 2)).transpose(1, 2)
+        return self._masked_norm(x, padding_mask, self.norm2)
+
+    @staticmethod
+    def _masked_norm(
+        x: torch.Tensor, padding_mask: torch.Tensor, norm: nn.BatchNorm1d
+    ) -> torch.Tensor:
+        """Normalizes valid visits and leaves padded outputs at zero.
+
+        Args:
+            x: Hidden states ``[B, T, d]``.
+            padding_mask: Boolean ``[B, T]``; True marks padding.
+            norm: Batch normalization with tracked running statistics.
+
+        Returns:
+            Hidden states of the same shape. Singleton training uses the
+            stored statistics, leaving running moments and the batch counter
+            unchanged because one observation has no unbiased variance.
+        """
+        valid = ~padding_mask
+        values = x[valid]
+        if norm.training and values.size(0) <= 1:
+            values = F.batch_norm(
+                values,
+                norm.running_mean,
+                norm.running_var,
+                norm.weight,
+                norm.bias,
+                training=False,
+                eps=norm.eps,
+            )
+        else:
+            values = norm(values)
+        out = torch.zeros_like(x)
+        out[valid] = values
+        return out
 
 
 class VisitTransformer(BaseModel):
@@ -112,21 +182,23 @@ class VisitTransformer(BaseModel):
     of attention and pooling. An optional ``<feature_key>_mask`` boolean
     tensor ``[B, T]`` marks real visits, including all-zero visits after
     normalization. Without it, all-zero rows are treated as padding.
+    NaN measurements are filled with zero; infinite measurements in retained
+    visits raise ``ValueError`` before projection or attention.
 
     Three architectures are available:
 
-    * ``"encoder"`` (default, the configuration reported in the first
-      author's thesis): a Transformer encoder followed by masked mean pooling.
-    * ``"encoder_decoder"`` (the configuration reported in the paper): an
+    * ``"encoder"`` (default, a team variant): a Transformer encoder followed
+      by masked mean pooling.
+    * ``"encoder_decoder"`` (an approximation of the paper's architecture): an
       encoder followed by a decoder in which one learned query token attends
       to the encoded visits; the query's output is classified.
     * ``"tst"``: the Time Series Transformer of Zerveas et al. (KDD 2021),
       the paper's other Transformer baseline. Inputs are scaled by
       ``sqrt(d)`` and given fixed sine/cosine positions, the encoder layers
-      use batch normalization and GELU, and the outputs of all
+      use batch normalization over valid visits and GELU, and the outputs of all
       ``max_visits`` positions (padding set to zero) are concatenated,
-      ``[B, max_visits * d] @ [max_visits * d, C] -> [B, C]``. Its usual
-      settings are ``embedding_dim=64, num_heads=8, num_layers=3,
+      ``[B, max_visits * d] @ [max_visits * d, C] -> [B, C]``. Example settings
+      are ``embedding_dim=64, num_heads=8, num_layers=3,
       feedforward_dim=256, dropout=0.1`` with a small ``max_visits``.
 
     Args:
@@ -138,17 +210,37 @@ class VisitTransformer(BaseModel):
         num_decoder_layers: Decoder layers for ``"encoder_decoder"``.
             Default 8.
         feedforward_dim: Hidden width of each feed-forward block. Default 512.
-        dropout: Dropout rate. Default 0.3.
+        dropout: Finite dropout rate in ``[0, 1]``. Default 0.3.
         max_visits: Maximum number of visits; longer inputs keep the most
             recent ``max_visits`` visits. With ``"tst"`` every input is
             padded to this length. Default 64.
         architecture: ``"encoder"``, ``"encoder_decoder"`` or ``"tst"``.
         loss: ``"ce"`` (cross-entropy), ``"weighted_ce"`` (cross-entropy with
             class weights) or ``"focal"`` (focal loss).
-        class_weights: Weights per class index for ``"weighted_ce"`` and
-            ``"focal"``. ``None`` with ``"weighted_ce"`` computes inverse
-            class frequencies from ``dataset``.
-        focal_gamma: Focusing parameter of the focal loss. Default 2.0.
+        class_weights: Optional one-dimensional vector of finite, strictly
+            positive weights in label-processor class order. Explicit weights
+            apply to all losses, including ``"ce"``. ``None`` with
+            ``"weighted_ce"`` computes inverse class frequencies from
+            ``dataset``; pass the training split to avoid using held-out labels.
+            Weighted CE divides by the batch's target-weight sum; focal loss
+            averages its optionally weighted terms over the batch size.
+        focal_gamma: Finite, nonnegative focusing parameter. Default 2.0.
+
+    Raises:
+        ValueError: If dimensions or layer counts are not positive integers,
+            heads do not divide the embedding width, loss settings are invalid,
+            or the dataset does not define one multiclass label and one input.
+
+    Notes:
+        Learned positions, pre-norm layers, final layer norms, a single learned
+        decoder query and feed-forward width 512 are implementation assumptions.
+        Matching the paper's reported layer counts and width does not establish
+        architectural or parameter-count equivalence; see the module's
+        reproduction boundary and the API documentation. Encoder and decoder
+        layers receive independent Xavier-uniform matrix initialization, zero
+        biases and unit layer-normalization scales. TST's masked normalization
+        and singleton fallback are documented team adaptations. Other patients'
+        real visits still affect training outputs through batch normalization.
 
     Examples:
         >>> from pyhealth.datasets import create_sample_dataset
@@ -205,11 +297,33 @@ class VisitTransformer(BaseModel):
             raise ValueError(f"architecture must be one of {ARCHITECTURES}")
         if loss not in LOSSES:
             raise ValueError(f"loss must be one of {LOSSES}")
+        dimensions = {
+            "embedding_dim": embedding_dim,
+            "num_heads": num_heads,
+            "num_layers": num_layers,
+            "num_decoder_layers": num_decoder_layers,
+            "feedforward_dim": feedforward_dim,
+            "max_visits": max_visits,
+        }
+        for name, value in dimensions.items():
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+                raise ValueError(f"{name} must be positive integer")
         if embedding_dim % num_heads != 0:
             raise ValueError("embedding_dim must be divisible by num_heads")
-
-        if max_visits < 1:
-            raise ValueError("max_visits must be positive")
+        if (
+            isinstance(dropout, bool)
+            or not isinstance(dropout, Real)
+            or not math.isfinite(dropout)
+            or not 0 <= dropout <= 1
+        ):
+            raise ValueError("dropout must be finite and between 0 and 1")
+        if (
+            isinstance(focal_gamma, bool)
+            or not isinstance(focal_gamma, Real)
+            or not math.isfinite(focal_gamma)
+            or focal_gamma < 0
+        ):
+            raise ValueError("focal_gamma must be finite and nonnegative")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
@@ -248,6 +362,7 @@ class VisitTransformer(BaseModel):
             self.encoder = nn.TransformerEncoder(
                 encoder_layer, num_layers=num_layers, enable_nested_tensor=False
             )
+            self._initialize_stack(self.encoder)
             self.encoder_norm = nn.LayerNorm(embedding_dim)
             if architecture == "encoder_decoder":
                 decoder_layer = nn.TransformerDecoderLayer(
@@ -261,6 +376,7 @@ class VisitTransformer(BaseModel):
                 self.decoder = nn.TransformerDecoder(
                     decoder_layer, num_layers=num_decoder_layers
                 )
+                self._initialize_stack(self.decoder)
                 self.query = nn.Parameter(torch.zeros(1, 1, embedding_dim))
                 nn.init.normal_(self.query, std=0.02)
                 self.decoder_norm = nn.LayerNorm(embedding_dim)
@@ -273,8 +389,39 @@ class VisitTransformer(BaseModel):
         )
         self._use_weights = weights is not None
 
+    @staticmethod
+    def _initialize_stack(stack: nn.Module) -> None:
+        """Independently initializes cloned Transformer layers.
+
+        Matrix weights use Xavier uniform initialization. Biases start at
+        zero; layer-normalization scales retain their unit initialization.
+        The caller's Torch RNG controls reproducibility without reseeding
+        individual layers.
+
+        Args:
+            stack: Encoder or decoder stack whose matrix weights and biases
+                are initialized in place.
+
+        Returns:
+            None.
+        """
+        for name, parameter in stack.named_parameters():
+            if parameter.ndim > 1:
+                nn.init.xavier_uniform_(parameter)
+            elif name.endswith("bias"):
+                nn.init.zeros_(parameter)
+
     def _infer_input_dim(self, dataset: SampleDataset) -> int:
-        """Reads the number of columns per visit from the dataset."""
+        """Reads the number of columns per visit from the dataset.
+
+        Args:
+            dataset: Dataset with a fitted input processor for the visit
+                feature, or at least one processed sample for the fallback.
+
+        Returns:
+            The processor's positive feature width, falling back to the last
+            dimension of the first sample's tensor.
+        """
         processor = dataset.input_processors.get(self.feature_key)
         size = processor.size() if processor is not None else None
         if isinstance(size, int) and size > 0:
@@ -290,14 +437,36 @@ class VisitTransformer(BaseModel):
         loss: str,
         class_weights: Sequence[float] | None,
     ) -> torch.Tensor | None:
-        """Returns per-class loss weights, or ``None`` for unweighted losses."""
+        """Resolves explicit weights or inverse training-label frequencies.
+
+        Args:
+            dataset: Processed training samples used only for automatic
+                weights. Each label is a scalar class index.
+            loss: Loss name; only ``weighted_ce`` requests automatic weights.
+            class_weights: Optional weights in label-processor class order.
+
+        Returns:
+            A detached float32 CPU vector ``[C]``, or None for an unweighted
+            loss. Automatic weights use ``N / (C * count)`` after clamping
+            absent-class counts to one; explicit weights apply to every loss.
+
+        Raises:
+            ValueError: If explicit weights have the wrong shape, are
+                non-finite, or are not strictly positive.
+        """
         if class_weights is not None:
-            weights = torch.as_tensor(class_weights, dtype=torch.float32)
-            if weights.numel() != self.num_classes:
+            weights = (
+                torch.as_tensor(class_weights, dtype=torch.float32, device="cpu")
+                .detach()
+                .clone()
+            )
+            if weights.ndim != 1 or weights.numel() != self.num_classes:
                 raise ValueError(
-                    f"class_weights needs {self.num_classes} values, "
-                    f"got {weights.numel()}"
+                    "class_weights must be a one-dimensional vector of "
+                    f"{self.num_classes} values"
                 )
+            if not torch.isfinite(weights).all() or not (weights > 0).all():
+                raise ValueError("class_weights must be finite and strictly positive")
             return weights
         if loss != "weighted_ce":
             return None
@@ -321,7 +490,12 @@ class VisitTransformer(BaseModel):
         if self.loss_name == "focal":
             log_prob = F.log_softmax(logits, dim=-1)
             log_pt = log_prob.gather(1, y_true.unsqueeze(1)).squeeze(1)
-            focal = -((1 - log_pt.exp()) ** self.focal_gamma) * log_pt
+            # Clamp only at the dtype's smallest normal value: fractional
+            # gamma must not differentiate 0**gamma at a perfect prediction.
+            one_minus_pt = (-torch.expm1(log_pt)).clamp_min(
+                torch.finfo(log_pt.dtype).tiny
+            )
+            focal = -(one_minus_pt**self.focal_gamma) * log_pt
             if weight is not None:
                 focal = focal * weight[y_true]
             return focal.mean()
@@ -330,9 +504,28 @@ class VisitTransformer(BaseModel):
     def _prepare_visits(
         self, x: torch.Tensor, mask: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Selects each patient's latest valid visits, then pads the batch."""
+        """Selects recent valid visits and validates their measurements.
+
+        Args:
+            x: Visit features ``[B, T, F]``. NaN entries are filled with zero
+                before inferring validity from nonzero rows.
+            mask: Optional boolean ``[B, T]``; True retains a visit, including
+                an all-zero visit. An explicit mask overrides zero detection.
+
+        Returns:
+            Packed visit features and a boolean validity mask. Each patient
+            retains at most ``max_visits`` recent visits before batch padding.
+            An empty history receives one valid, zero-valued fallback token.
+
+        Raises:
+            ValueError: If batch or visit dimensions are empty, the input is
+                not three-dimensional, the mask shape differs from ``[B, T]``,
+                or a retained measurement is infinite. Masked and truncated
+                visits are discarded before infinity validation.
+        """
         if x.ndim != 3 or x.size(0) == 0 or x.size(1) == 0:
             raise ValueError("Visit features must have nonempty shape [B, T, F]")
+        x = x.masked_fill(torch.isnan(x), 0.0)
         if mask is None:
             valid = x.ne(0).any(dim=-1)
         else:
@@ -342,6 +535,11 @@ class VisitTransformer(BaseModel):
         rows = [row[v][-self.max_visits :] for row, v in zip(x, valid)]
         lengths = torch.tensor([row.size(0) for row in rows], device=x.device)
         x = nn.utils.rnn.pad_sequence(rows, batch_first=True)
+        if torch.isinf(x).any():
+            raise ValueError(
+                "Visit features contain infinite values in retained visits; "
+                "use finite measurements or NaN for missing values."
+            )
         if x.size(1) == 0:
             x = F.pad(x, (0, 0, 0, 1))
         valid = torch.arange(x.size(1), device=x.device)[None, :] < lengths[:, None]
@@ -349,13 +547,12 @@ class VisitTransformer(BaseModel):
         valid[:, 0] |= lengths == 0
         return x, valid
 
-    def encode(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """Encodes a batch of visit sequences into one vector per sequence.
 
         Args:
-            x: Visit features ``[B, T, F]``.
+            x: Visit features ``[B, T, F]`` on the model's device. NaN entries
+                are filled with zero before validity is inferred.
             mask: Optional boolean ``[B, T]``; True marks a real visit. Without
                 a mask, all-zero rows are padding. Each patient's last
                 ``max_visits`` real visits are selected before batch padding.
@@ -363,6 +560,10 @@ class VisitTransformer(BaseModel):
         Returns:
             Sequence embeddings ``[B, d]``, or ``[B, max_visits * d]`` for
             ``"tst"``.
+
+        Raises:
+            ValueError: If input or mask shapes are invalid, or retained
+                visits contain infinite measurements.
         """
         x, valid = self._prepare_visits(x, mask)
         if self.architecture == "tst":
@@ -380,7 +581,16 @@ class VisitTransformer(BaseModel):
         return (h * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
 
     def _encode_tst(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """TST encoding: pads to ``max_visits`` and concatenates all positions."""
+        """Pads TST inputs and concatenates the encoded positions.
+
+        Args:
+            x: Prepared visit features ``[B, T, F]``, with ``T <= max_visits``.
+            valid: Boolean ``[B, T]`` mask from :meth:`_prepare_visits`.
+
+        Returns:
+            Encoded features ``[B, max_visits * d]`` with padded positions
+            zeroed before flattening.
+        """
         if x.size(1) < self.max_visits:
             padding = self.max_visits - x.size(1)
             x = F.pad(x, (0, 0, 0, padding))
@@ -392,26 +602,33 @@ class VisitTransformer(BaseModel):
         h = self.output_dropout(F.gelu(h)) * valid.unsqueeze(-1).to(h.dtype)
         return h.reshape(h.size(0), -1)
 
-    def forward(self, **kwargs: torch.Tensor | list) -> dict[str, torch.Tensor]:
+    def forward(
+        self, **kwargs: torch.Tensor | tuple[torch.Tensor, ...] | list[Any] | bool
+    ) -> dict[str, torch.Tensor]:
         """Runs the model on a collated batch.
 
         Args:
             **kwargs: The batch from a PyHealth dataloader. Must contain the
-                input feature ``[B, T, F]``; the label ``[B]`` is used for the
-                loss when present. Optional ``<feature_key>_mask`` is a boolean
+                input feature ``[B, T, F]`` as a tensor or a one-element tuple
+                containing it; the label ``[B]`` is used for the loss when
+                present. Optional ``<feature_key>_mask`` is a boolean
                 ``[B, T]`` tensor marking real visits. ``embed=True`` also
-                returns the sequence embeddings.
+                returns the sequence embeddings. NaN measurements are filled
+                with zero; retained infinite measurements are rejected.
 
         Returns:
             A dict with ``logit`` ``[B, C]`` and ``y_prob`` ``[B, C]``; with
             labels, also ``loss`` (scalar) and ``y_true`` ``[B]``; with
             ``embed=True``, also ``embed`` (see :meth:`encode`).
+
+        Raises:
+            ValueError: If input or mask shapes are invalid, or retained
+                visits contain infinite measurements.
         """
         x = kwargs[self.feature_key]
         if isinstance(x, (tuple, list)):
             x = x[0]
         x = torch.as_tensor(x).to(self.device, dtype=torch.float32)
-        x = torch.nan_to_num(x, nan=0.0)
         z = self.encode(x, mask=kwargs.get(f"{self.feature_key}_mask"))
         logits = self.classifier(z)
         results: dict[str, torch.Tensor] = {
