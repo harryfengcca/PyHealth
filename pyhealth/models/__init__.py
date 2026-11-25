@@ -82,6 +82,7 @@ from .torchvision_model import TorchvisionModel
 from .transformer import Transformer, TransformerLayer
 from .visit_transformer import VisitTransformer as VisitTransformer
 from .transformers_model import TransformersModel
+from .rasc import RASCCrossEncoder as RASCCrossEncoder
 from .llm_ehr_encoder import LLMEHREncoder as LLMEHREncoder
 from .ehr_fm import (
     EHRFoundationModelBase as EHRFoundationModelBase,
