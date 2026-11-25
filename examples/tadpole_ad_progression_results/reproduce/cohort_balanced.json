@@ -1,0 +1,119 @@
+{
+  "policy_version": 2,
+  "policy": "per_group_minority_downsampling",
+  "seed": 42,
+  "subjects_before": 1543,
+  "retained_subjects": 764,
+  "removed_by_type": {
+    "stable": 777,
+    "converter": 2
+  },
+  "before": {
+    "sequences_by_type": {
+      "stable": 1159,
+      "converter": 384
+    },
+    "sequences_by_group": {
+      "1": {
+        "converter": 53,
+        "stable": 98
+      },
+      "10": {
+        "stable": 27,
+        "converter": 3
+      },
+      "11": {
+        "stable": 13,
+        "converter": 1
+      },
+      "12": {
+        "converter": 2
+      },
+      "2": {
+        "stable": 227,
+        "converter": 71
+      },
+      "3": {
+        "stable": 289,
+        "converter": 86
+      },
+      "4": {
+        "stable": 234,
+        "converter": 69
+      },
+      "5": {
+        "stable": 145,
+        "converter": 42
+      },
+      "6": {
+        "converter": 26,
+        "stable": 59
+      },
+      "7": {
+        "stable": 18,
+        "converter": 7
+      },
+      "8": {
+        "stable": 21,
+        "converter": 14
+      },
+      "9": {
+        "stable": 28,
+        "converter": 10
+      }
+    }
+  },
+  "after": {
+    "sequences_by_type": {
+      "stable": 382,
+      "converter": 382
+    },
+    "sequences_by_group": {
+      "1": {
+        "converter": 53,
+        "stable": 53
+      },
+      "10": {
+        "stable": 3,
+        "converter": 3
+      },
+      "11": {
+        "stable": 1,
+        "converter": 1
+      },
+      "2": {
+        "converter": 71,
+        "stable": 71
+      },
+      "3": {
+        "stable": 86,
+        "converter": 86
+      },
+      "4": {
+        "stable": 69,
+        "converter": 69
+      },
+      "5": {
+        "stable": 42,
+        "converter": 42
+      },
+      "6": {
+        "converter": 26,
+        "stable": 26
+      },
+      "7": {
+        "stable": 7,
+        "converter": 7
+      },
+      "8": {
+        "stable": 14,
+        "converter": 14
+      },
+      "9": {
+        "stable": 10,
+        "converter": 10
+      }
+    }
+  },
+  "source_sha256": "ae4967ad3fb46adf4ea99c96f94b2e0720f4443c57b0debcf9c02fefc9ce45fd"
+}

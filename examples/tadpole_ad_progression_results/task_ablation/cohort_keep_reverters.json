@@ -1,0 +1,120 @@
+{
+  "population": "parsed TADPOLE events; all source subjects, no D1/D2 filter",
+  "drop_reverters": false,
+  "sequence_policy_version": 2,
+  "visit_preparation_diagnostics": {
+    "explicit_reversion_subjects": 75,
+    "observed_reversion_subjects": 100,
+    "additional_explicit_reversion_exclusions": 0,
+    "same_timestamp_groups": 3,
+    "exact_duplicate_groups": 0,
+    "complementary_merge_groups": 0,
+    "collapsed_source_rows": 0,
+    "ambiguous_same_day_groups": 3,
+    "conflicting_duplicate_groups": 0
+  },
+  "subjects": 1737,
+  "visits": 12741,
+  "subjects_by_membership": {
+    "d1": 1667,
+    "d2": 896
+  },
+  "excluded_subjects": {
+    "ambiguous_same_day_visits": 3,
+    "fewer_than_two_total_visits": 70,
+    "fewer_than_two_diagnosed_visits": 18
+  },
+  "excluded_visits_by_subject_reason": {
+    "ambiguous_same_day_visits": 29,
+    "fewer_than_two_total_visits": 70,
+    "fewer_than_two_diagnosed_visits": 41
+  },
+  "retained_subjects": 1646,
+  "sequences_by_type": {
+    "stable": 1161,
+    "converter": 417,
+    "reverter": 68
+  },
+  "sequences_by_group": {
+    "1": {
+      "converter": 60,
+      "stable": 98,
+      "reverter": 14
+    },
+    "10": {
+      "stable": 27,
+      "converter": 3
+    },
+    "11": {
+      "stable": 13,
+      "converter": 1
+    },
+    "12": {
+      "converter": 2,
+      "reverter": 1
+    },
+    "2": {
+      "converter": 78,
+      "stable": 227,
+      "reverter": 16
+    },
+    "3": {
+      "stable": 290,
+      "converter": 90,
+      "reverter": 13
+    },
+    "4": {
+      "stable": 234,
+      "converter": 73,
+      "reverter": 10
+    },
+    "5": {
+      "stable": 145,
+      "converter": 49,
+      "reverter": 11
+    },
+    "6": {
+      "converter": 28,
+      "stable": 60,
+      "reverter": 2
+    },
+    "7": {
+      "stable": 18,
+      "reverter": 1,
+      "converter": 9
+    },
+    "8": {
+      "stable": 21,
+      "converter": 14
+    },
+    "9": {
+      "stable": 28,
+      "converter": 10
+    }
+  },
+  "target_diagnoses": {
+    "AD": 631,
+    "CN": 471,
+    "MCI": 544
+  },
+  "transitions": {
+    "AD->AD": 309,
+    "CN->CN": 408,
+    "MCI->AD": 318,
+    "CN->MCI": 95,
+    "MCI->MCI": 444,
+    "MCI->CN": 63,
+    "AD->MCI": 5,
+    "CN->AD": 4
+  },
+  "missing_diagnoses": 3837,
+  "unrecognized_diagnoses": 0,
+  "visit_ledger": {
+    "excluded_subject_visits": 140,
+    "selected_input_and_target_visits": 7780,
+    "missing_diagnosis_visits_before_target": 2663,
+    "visits_after_selected_target": 2158,
+    "collapsed_duplicate_rows_in_retained_subjects": 0
+  },
+  "source_sha256": "ae4967ad3fb46adf4ea99c96f94b2e0720f4443c57b0debcf9c02fefc9ce45fd"
+}

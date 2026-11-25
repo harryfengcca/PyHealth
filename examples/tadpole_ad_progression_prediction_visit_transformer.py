@@ -84,8 +84,8 @@ The table reports weighted F1; ``summary.csv`` also has macro F1.
 Protocol choices the paper leaves open (repeated exam dates, balancing of
 groups with few stable sequences, metric edge cases) and the differences
 of our encoder-decoder from the paper's (8.46M parameters here, 6.60M in
-the paper) are listed in ``examples/tadpole_reproducibility.md`` and the
-``VisitTransformer`` API page.
+the paper) are listed in ``examples/tadpole_ad_progression_results/README.md``
+and the ``VisitTransformer`` API page.
 
 Usage
 -----
@@ -120,140 +120,115 @@ new ``--output-dir``.
 
 Results
 -------
-RERUN-PENDING: the tables and findings below are from an earlier code
-version and are replaced after the rerun.
+Full tables with standard deviations, the figures and the protocol details
+are in ``examples/tadpole_ad_progression_results/`` (README.md, one folder
+of summaries and per-fold runs per experiment).
 
-Setup: TADPOLE D1/D2 (1,543 sequences after the paper's rules: 1,159 stable,
-384 converter), patient-level folds stratified by sequence type and group,
-15% of the training patients held out for early stopping on validation
-balanced accuracy (macro recall),
-batch size 32, Adam lr 1e-4, weight decay 1e-5, up to 200 epochs with
-patience 20, seed 42, one GH200 GPU (20-70 s per training run). The
-month-by-month RNNs use the reference's settings instead (100 epochs,
-batch 128, lr 1.29e-3; 3-8 min per run). Tables show the mean over folds;
-standard deviations are in ``summary.csv``.
-"Conv." is the converter subset; "T4 AUROC" is converter detection.
+Setup: TADPOLE D1/D2, 1,543 sequences after the paper's rules (1,159
+stable, 384 converter; the paper has 1,627), balanced dataset 764.
+Patient-level folds stratified by sequence type and group; 15% of the
+training patients held out for early stopping on validation balanced
+accuracy (macro recall); batch 32, Adam lr 1e-4, weight decay 1e-5, up to
+200 epochs, patience 20, seed 42. Month-by-month RNNs use the settings of
+Nguyen et al. (100 epochs, batch 128, lr 1.29e-3). One GH200 GPU, 305
+training runs. Means over folds; "Conv." is the converter subset, "T4" the
+converter-detection AUROC.
 
-Reproduction (10 folds). Paper rows are from its Tables 2-5::
+Paper setup (10 folds), raw dataset; paper values from its Tables 2-5::
 
-    Model                     mAUC    F1   Acc   BCA  Stable  Conv.  Conv.  T4
-                                                       Acc    Acc    BCA  AUROC
-    Raw, VisitTransformer     .957  .836  .840  .884  .920   .598   .559  .862
-    Raw, LSTM (PyHealth)      .943  .826  .833  .879  .906   .611   .563  .835
-    Raw, GRU (PyHealth)       .944  .832  .835  .881  .921   .577   .550  .840
-    Raw, Transformer (paper)  .920  .824  .824  .874  .883   .648   .648    -
-    Raw, LSTM (paper)         .857  .786  .789  .829  .973   .217   .476    -
-    Raw, GRU (paper)          .846  .786  .792  .830  .984   .184   .464    -
-    Bal., VisitTransformer    .917  .801  .812  .844  .838   .787   .657  .853
-    Bal., LSTM (PyHealth)     .885  .779  .794  .831  .814   .774   .647  .828
-    Bal., GRU (PyHealth)      .896  .787  .796  .821  .782   .810   .685  .844
-    Bal., Transformer (paper) .883  .746  .802  .839  .814   .792   .713    -
-    Bal., LSTM (paper)        .857  .786  .684  .770  .926   .439   .566    -
-    Bal., GRU (paper)         .846  .786  .648  .758  .974   .323   .512    -
+    Model                      mAUC   BCA  Stable  Conv.  Conv.   T4
+                                           Acc     Acc    BCA  AUROC
+    Transformer (enc.-dec.)    .956  .880  .910   .604   .564   .861
+      paper                    .920  .874  .883   .648   .648     -
+    TST                        .954  .888  .922   .607   .555   .856
+      paper                    .938  .866  .856   .694   .662     -
+    minimalRNN, monthly        .939  .841  .991   .091   .336   .822
+      paper                    .873  .819  .986   .129   .442     -
+    LSTM, monthly              .910  .853  .975   .219   .387   .757
+      paper                    .857  .829  .973   .217   .476     -
+    GRU, monthly               .904  .841  .986   .109   .342   .742
+      paper                    .846  .830  .984   .184   .464     -
+    Copy last diagnosis        .838  .831 1.000   .000   .299   .500
 
-Findings. (1) VisitTransformer reaches the paper's overall numbers (raw BCA
-.884 vs .874, mAUC .957 vs .920) and its balanced converter accuracy (.787
-vs .792); on the raw data its converter accuracy is lower (.598 vs .648).
-(2) Trained with the same next-visit objective, PyHealth's LSTM and GRU
-reach the Transformer's converter accuracy (.58-.61 vs .598), unlike the
-paper's RNNs (at most .217); the paper's setup below explains why.
-(3) Welch's t-test across the 10 folds: the Transformer has significantly
-higher mAUC than LSTM (raw p = .019, balanced p = .005) and GRU (raw
-p = .033), and ranks converters better (T4 AUROC .862 vs .835-.840), but
-its BCA and converter accuracy are not significantly different (p > .28);
-on the balanced data GRU has a higher converter BCA (p = .037). (4) The
-converter sensitivity averaged over three classes is lower than the
-paper's (.270 vs .430): on the raw data our Transformer recognizes
-MCI-to-AD conversions well (sensitivity .739) but CN-to-MCI conversions
-rarely (.072).
+Balanced dataset, converter accuracy (paper): Transformer .783 (.792), TST
+.772 (.775), minimalRNN .225 (.291), LSTM .387 (.439), GRU .233 (.323).
 
-Paper setup (10 folds, the same splits as above): the paper's
-encoder-decoder Transformer ("paper Transformer") and the TST on
-model-filled inputs, and the month-by-month RNN baselines. Paper rows are
-from its Tables 2-5::
+Next-visit training (10 folds, the same splits)::
 
-    Model                     mAUC    F1   Acc   BCA  Stable  Conv.  Conv.  T4
-                                                       Acc    Acc    BCA  AUROC
-    Raw, paper Transformer    .957  .830  .835  .881  .920   .577   .547  .859
-    Raw, TST                  .954  .831  .836  .882  .917   .590   .554  .855
-    Raw, minimalRNN monthly   .935  .759  .764  .838  .989   .086   .335  .809
-    Raw, LSTM monthly         .910  .780  .783  .850  .971   .216   .390  .753
-    Raw, GRU monthly          .896  .762  .767  .840  .985   .107   .344  .718
-    Raw, TST (paper)          .938  .812  .814  .866  .856   .694   .662    -
-    Raw, minimalRNN (paper)   .873  .766  .777  .819  .986   .129   .442    -
-    Bal., paper Transformer   .907  .789  .798  .826  .793   .803   .680  .847
-    Bal., TST                 .908  .785  .795  .831  .804   .787   .670  .841
-    Bal., minimalRNN monthly  .880  .579  .579  .742  .952   .206   .386  .830
-    Bal., LSTM monthly        .845  .669  .663  .779  .916   .411   .473  .773
-    Bal., GRU monthly         .839  .611  .605  .754  .971   .242   .399  .801
-    Bal., TST (paper)         .890  .721  .779  .822  .787   .775   .703    -
-    Bal., minimalRNN (paper)  .873  .766  .623  .742  .956   .291   .499    -
+    Model                Data       mAUC   BCA  Stable  Conv.  Conv.   T4
+                                                Acc     Acc    BCA  AUROC
+    VisitTransformer     raw        .956  .884  .914   .615   .566   .856
+    LSTM (PyHealth RNN)  raw        .952  .885  .902   .662   .593   .855
+    GRU (PyHealth RNN)   raw        .955  .883  .907   .636   .577   .862
+    VisitTransformer     balanced   .910  .837  .814   .785   .654   .847
+    LSTM (PyHealth RNN)  balanced   .904  .839  .809   .801   .679   .844
+    GRU (PyHealth RNN)   balanced   .909  .851  .829   .809   .680   .859
 
-Findings. (5) With the paper's training, the paper's comparison
-reproduces closely: the month-by-month RNNs reach converter accuracy
-.086-.216 on the raw data (paper .129-.217) and .206-.411 on the balanced
-data (paper .291-.439), with stable accuracy .97-.99 (paper .97-.99), and
-the Transformer beats every one of them in converter accuracy (p < 1e-4)
-and BCA (p <= .005; Welch's t-test, 10 folds). (6) Ablation M1: on the same
-folds, the same LSTM and GRU trained as next-visit classifiers reach
-converter accuracy .58-.61 (raw) and .77-.81 (balanced) instead of
-.11-.41 (paired t-test, p < 1e-6), and lose their stable-accuracy edge
-(.91-.92 vs .97-.99 on the raw data). The paper's Transformer-RNN gap comes
-from the month-by-month training, which learns to keep the current
-diagnosis (CN-to-MCI sensitivity 0, MCI-to-AD .11-.28 on the raw data),
-not from recurrence itself. (7) The TST and the paper's Transformer do not
-differ significantly on any tested metric (p > .45), whereas the paper
-reports a higher mAUC and converter accuracy for the TST.
+Findings. (1) The paper's comparison reproduces: with the paper's setup,
+the Transformer's converter accuracy (.604 raw, .783 balanced) is within
+fold noise of the paper's (.648, .792; one-sample t-test p = .31, .71),
+it beats every month-by-month RNN on converter accuracy (p < 1e-4) and
+BCA (p <= .014; Welch's t-test), and the RNNs keep a stable accuracy of
+.98-.99, as in the paper. (2) mAUC is higher than the paper's for every
+model (+.02 to +.07), likely because of our random patient-level folds
+(the paper uses a temporal split) and early stopping on held-out
+patients. (3) Converter sensitivity is lower (.28 vs .43): CN-to-MCI
+conversions, 22% of our converters (17% in the paper), are rarely
+predicted (sensitivity .07, vs .76 for MCI-to-AD). (4) The TST and the
+paper's Transformer do not differ (p > .45); the paper reports a higher
+TST converter accuracy (.694). (5) Ablation M1 (new): on the same folds,
+the same LSTM and GRU trained as next-visit classifiers reach converter
+accuracy .64-.66 instead of .11-.22 (paired t-test, p < 2e-6) and match
+VisitTransformer on every metric (Welch p > .17). The paper's
+Transformer-RNN gap comes from the month-by-month training, which mostly
+keeps the current diagnosis (its BCA is .01-.02 above copying the last
+diagnosis), not from recurrence.
 
-Task ablation (5 folds; the same splits for both models)::
+Task ablation (new; 5 folds; the same splits for both models)::
 
-                                      LSTM (PyHealth)     VisitTransformer
-    Task configuration               BCA  Conv. T4 AUC   BCA  Conv. T4 AUC
-                                          Acc                 Acc
-    T0  paper task (default)         .884  .603  .826    .890  .592  .858
-    T1a no forward fill              .879  .577  .821    .884  .563  .855
-    T1b ffill + missing indicators   .881  .610  .826    .885  .615  .859
-    T2a no time feature              .875  .564  .825    .882  .581  .853
-    T2b months since prev. visit     .880  .592  .828    .889  .633  .858
-    T3  keep reverters               .842  .578  .823    .850  .650  .851
+                                         LSTM (PyHealth)    VisitTransformer
+    Task configuration                  BCA  Conv.  T4     BCA  Conv.  T4
+                                             Acc   AUROC        Acc   AUROC
+    T0  paper task (default)           .878  .625  .860   .882  .625  .851
+    T1a no forward fill                .881  .604  .845   .884  .578  .846
+    T1b ffill + missing indicators     .884  .648  .859   .887  .672  .852
+    T2a no time feature                .883  .638  .853   .883  .620  .857
+    T2b months since previous visit    .875  .599  .853   .885  .612  .845
+    T3  keep reverters                 .845  .638  .851   .846  .664  .853
 
-Findings. Both models move in the same direction. Forward filling helps
-converters (accuracy -.03 without it); explicit missing-value indicators
-do not improve BCA. Dropping the time feature costs about .01 BCA. Months since
-the previous visit, which does not reveal how far ahead the target visit
-is, performs as well as the paper's months-to-target feature (BCA .889 vs
-.890) and gives the Transformer its best converter accuracy among T0-T2
-(.633). Keeping reverters lowers BCA by about .04 for both models: the
-models almost never predict an improving diagnosis (reverter accuracy .07
-for LSTM, .18 for the Transformer). Apart from T3, the differences are at
-most .01 BCA, comparable to the fold-to-fold standard deviation
-(.003-.011).
+Findings. Both models respond the same way and never differ from each
+other (paired p >= .07). Missing-value indicators give the largest gain
+(Transformer converter accuracy +.047, p = .06); dropping forward fill
+costs converter accuracy (-.02 LSTM, -.05 Transformer). The time feature
+does not matter: removing it, or replacing "months to target" by "months
+since the previous visit", changes BCA by at most .005. Keeping reverters
+lowers BCA by .035 (p <= .02), because the models get only 28% of
+reverters right: they rarely predict an improving diagnosis.
 
-Model ablation (5 folds, VisitTransformer, task T0)::
+Model ablation (new; 5 folds; VisitTransformer, task T0)::
 
-    Configuration                 Params   BCA  Stable  Conv.  Conv.   T4
-                                                 Acc    Acc    Sens  AUROC
-    M0  encoder, d128, CE (def.)   0.81M  .890   .932   .592   .272   .858
-    M2a class-weighted CE          0.81M  .887   .923   .600   .272   .852
-    M2b focal loss                 0.81M  .883   .911   .620   .272   .857
-    M3a paper enc.-dec. d256 4+8   8.46M  .888   .929   .589   .264   .864
-    M3b embedding 64               0.34M  .886   .934   .555   .236   .853
-    M3c embedding 256              2.13M  .886   .922   .602   .279   .858
-    M3d 2 encoder layers           0.41M  .885   .918   .602   .269   .861
-    M3e dropout 0.1                0.81M  .885   .926   .587   .301   .859
-    M3f learning rate 1e-3         0.81M  .881   .908   .623   .317   .855
+    Configuration                    Params   BCA  Stable  Conv.   T4
+                                                   Acc     Acc   AUROC
+    M0  encoder, d128, CE (default)   0.81M  .882  .909   .625   .851
+    M2a class-weighted CE             0.81M  .887  .921   .612   .850
+    M2b focal loss                    0.81M  .886  .919   .614   .847
+    M3a paper encoder-decoder         8.46M  .884  .915   .614   .861
+    M3b embedding 64                  0.34M  .882  .918   .591   .853
+    M3c embedding 256                 2.13M  .886  .923   .599   .857
+    M3d 2 encoder layers              0.41M  .885  .917   .615   .850
+    M3e dropout 0.1                   0.81M  .879  .911   .609   .854
+    M3f learning rate 1e-3            0.81M  .884  .915   .620   .859
 
-Findings. The model is insensitive to its configuration: every variant is
-within .01 BCA of the default. The paper's encoder-decoder (8.46M
-parameters here; the paper reports 6.6M with an unreported feed-forward
-width) is no better than a 0.81M-parameter encoder on 1.5k sequences.
-Class-weighted and focal losses, and a larger learning rate, trade stable
-accuracy for converter accuracy without improving BCA. T0 and M0 are the
-same configuration and give identical numbers, which confirms that runs
-are deterministic for a given seed and split.
+Findings. No variant differs from the default by more than .005 BCA
+(paired p >= .18): the paper's 8.46M-parameter encoder-decoder is no
+better than a 0.34M-parameter encoder on 1.5k sequences, and re-weighted
+losses do not raise converter accuracy. T0 and M0 are the same
+configuration and give identical numbers, which confirms that runs are
+deterministic for a given seed and split.
 
-Synthetic smoke test (``--experiment quick``): the pipeline runs end to end
-(data loading -> task -> training -> evaluation) and produces every metric.
+Synthetic data (``--experiment quick``, about 25 s on a CPU) runs the
+whole pipeline and produces every metric; its numbers only show that the
+pipeline runs.
 """
 
 import argparse
@@ -309,8 +284,8 @@ SUMMARY_FORMAT_VERSION = 2
 # Experiment configurations
 # --------------------------------------------------------------------------
 
-# Reported dimensions only; query/readout and other choices remain assumptions.
-# See tadpole_reproducibility.md for the unresolved parameter-count difference.
+# The paper's reported dimensions. Its decoder input, readout and feed-forward
+# width are not reported (8.46M parameters here, 6.60M in the paper).
 PAPER_ARCH = {
     "architecture": "encoder_decoder",
     "embedding_dim": 256,
@@ -365,7 +340,7 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
         for data in ("raw", "balanced")
         for model in ("visit_transformer", "lstm", "gru", "copy_last")
     ]
-    # The paper's own setup; differences are listed in tadpole_reproducibility.md.
+    # The paper's own setup; see tadpole_ad_progression_results/README.md.
     # "Model filling" replaces forward fill: missing
     # input values are predicted by a minimalRNN trained month by month on
     # the training patients of the fold. The RNN baselines are trained the

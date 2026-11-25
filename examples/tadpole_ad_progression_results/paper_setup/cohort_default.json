@@ -1,0 +1,111 @@
+{
+  "population": "parsed TADPOLE events; all source subjects, no D1/D2 filter",
+  "drop_reverters": true,
+  "sequence_policy_version": 2,
+  "visit_preparation_diagnostics": {
+    "explicit_reversion_subjects": 75,
+    "observed_reversion_subjects": 100,
+    "additional_explicit_reversion_exclusions": 3,
+    "same_timestamp_groups": 3,
+    "exact_duplicate_groups": 0,
+    "complementary_merge_groups": 0,
+    "collapsed_source_rows": 0,
+    "ambiguous_same_day_groups": 3,
+    "conflicting_duplicate_groups": 0
+  },
+  "subjects": 1737,
+  "visits": 12741,
+  "subjects_by_membership": {
+    "d1": 1667,
+    "d2": 896
+  },
+  "excluded_subjects": {
+    "reverter": 103,
+    "ambiguous_same_day_visits": 3,
+    "fewer_than_two_total_visits": 70,
+    "fewer_than_two_diagnosed_visits": 18
+  },
+  "excluded_visits_by_subject_reason": {
+    "reverter": 1002,
+    "ambiguous_same_day_visits": 29,
+    "fewer_than_two_total_visits": 70,
+    "fewer_than_two_diagnosed_visits": 41
+  },
+  "retained_subjects": 1543,
+  "sequences_by_type": {
+    "stable": 1159,
+    "converter": 384
+  },
+  "sequences_by_group": {
+    "1": {
+      "converter": 53,
+      "stable": 98
+    },
+    "10": {
+      "stable": 27,
+      "converter": 3
+    },
+    "11": {
+      "stable": 13,
+      "converter": 1
+    },
+    "12": {
+      "converter": 2
+    },
+    "2": {
+      "stable": 227,
+      "converter": 71
+    },
+    "3": {
+      "stable": 289,
+      "converter": 86
+    },
+    "4": {
+      "stable": 234,
+      "converter": 69
+    },
+    "5": {
+      "stable": 145,
+      "converter": 42
+    },
+    "6": {
+      "converter": 26,
+      "stable": 59
+    },
+    "7": {
+      "stable": 18,
+      "converter": 7
+    },
+    "8": {
+      "stable": 21,
+      "converter": 14
+    },
+    "9": {
+      "stable": 28,
+      "converter": 10
+    }
+  },
+  "target_diagnoses": {
+    "AD": 612,
+    "CN": 407,
+    "MCI": 524
+  },
+  "transitions": {
+    "AD->AD": 309,
+    "CN->CN": 407,
+    "MCI->AD": 300,
+    "MCI->MCI": 443,
+    "CN->MCI": 81,
+    "CN->AD": 3
+  },
+  "missing_diagnoses": 3837,
+  "unrecognized_diagnoses": 0,
+  "visit_ledger": {
+    "excluded_subject_visits": 1142,
+    "selected_input_and_target_visits": 7347,
+    "missing_diagnosis_visits_before_target": 2509,
+    "visits_after_selected_target": 1743,
+    "collapsed_duplicate_rows_in_retained_subjects": 0
+  },
+  "source_sha256": "ae4967ad3fb46adf4ea99c96f94b2e0720f4443c57b0debcf9c02fefc9ce45fd"
+}
