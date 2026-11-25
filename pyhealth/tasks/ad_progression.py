@@ -21,19 +21,19 @@ Sequences" (CHIL 2025, https://proceedings.mlr.press/v287/moghaddami25a.html):
 given a subject's first ``n`` visits, predict the clinical diagnosis
 (CN, MCI or AD) at visit ``n + 1``.
 
-Visits first pass through :func:`prepare_patient_visits`: matching visit
-identities are deduplicated or compatibly merged; conflicts and ambiguous
-same-timestamp visits exclude the subject. This duplicate policy is a team
-processing decision. Explicit transition strings and observed stage changes
-are both checked for reversions before first-conversion truncation.
-
 Each subject yields at most one sample, built with the paper's rules:
 
 1. Subjects with a single visit are dropped.
 2. Subjects whose diagnosis ever moves to a milder stage ("reverters",
-   MCI to CN or AD to MCI) are dropped.
+   MCI to CN or AD to MCI) are dropped. A transition string such as
+   ``"MCI to NL"`` also counts as a reversion.
 3. Visits after a subject's first conversion are discarded.
 4. Visits without a diagnosis are discarded.
+
+The paper does not say how repeated records of one exam date are handled.
+:func:`prepare_patient_visits` merges records of the same date and visit code
+when they agree, and drops the subject when they conflict or carry different
+visit codes (3 of 1,737 subjects in TADPOLE D1/D2).
 
 The longest remaining sequence is used. It is a *converter* sequence if the
 diagnosis at its last visit is more severe than at the visit before, and a
@@ -230,28 +230,24 @@ class _PreparedPatient:
 def prepare_patient_visits(
     patient: Any, drop_reverters: bool = True
 ) -> _PreparedPatient:
-    """Resolves visits and applies the task's shared sequence policy.
+    """Merges a subject's records into visits and applies the sequence rules.
 
-    Exact duplicates in selected fields collapse to one visit. Complementary
-    records merge only when timestamp and nonempty visit code agree and all
-    overlapping selected measurements/diagnoses agree. Different visit codes
-    at the same timestamp, unidentified nonidentical visits, and conflicting
-    records exclude the subject. This conservative duplicate policy is a team
-    decision, not a duplicate-resolution method specified by the paper.
-
-    Explicit reversions are detected from every source row before merging.
-    Both explicit and observed reversions exclude the subject by default,
-    including reversions after a first conversion. With ``drop_reverters=False``
-    those subjects are kept and labels follow observed destination diagnoses.
+    Records with the same exam date are one visit. Identical records collapse;
+    records with the same visit code merge when every value they share
+    agrees. The subject is excluded if same-date records conflict or have
+    different visit codes, since their order is then unknown. A reversion,
+    either between visits or inside a transition string such as
+    ``"MCI to NL"``, excludes the subject when ``drop_reverters`` is set.
+    Shared by the task, the example's cohort audit and its monthly baselines.
 
     Args:
-        patient: Patient exposing timestamped ``tadpole`` events.
-        drop_reverters: Whether to exclude explicit or observed reversions.
+        patient: Patient with timestamped ``tadpole`` events.
+        drop_reverters: Whether subjects with a reversion are excluded.
 
     Returns:
-        Resolved visits, selection or exclusion reason, original events, and
-        aggregate diagnostics. No original event is modified. Diagnostic
-        counts can overlap; the audit's visit ledger accounts for rows once.
+        The merged visits, the selected sequence (or ``None``), the reason a
+        subject was excluded (or ``None``), the source events (unchanged) and
+        counts of the merge and exclusion cases.
 
     Examples:
         >>> from types import SimpleNamespace
@@ -386,12 +382,10 @@ class ADProgressionPrediction(BaseTask):
       the 22 features in :data:`FEATURE_COLUMNS` (``nan`` where missing),
       the diagnosis one-hot in :data:`DX_CLASSES` order, and an optional time
       feature in months. By default ``F = 26``.
-    * ``visits_mask``: a boolean tensor marking every input visit as real.
-      The dataloader pads it with False, preserving real visits even if all
-      their features become zero after normalization and imputation.
-    * ``label``: the diagnosis at the target visit, ``CN``, ``MCI`` or ``AD``.
-      The label processor always uses this class order (indices 0, 1 and 2),
-      including when a small training split lacks one of the diagnoses.
+    * ``visits_mask``: ``[n]`` booleans, all ``True``. Batches pad it with
+      ``False``, so models can tell real visits from padding.
+    * ``label``: the diagnosis at the target visit, ``CN``, ``MCI`` or ``AD``,
+      always encoded as 0, 1 and 2, even if a training split lacks a class.
     * ``seq_type``: ``"stable"``, ``"converter"`` or ``"reverter"``.
     * ``group``: the number of input visits ``n`` (the paper's group).
     * ``last_dx``: the diagnosis at the last input visit.
@@ -410,8 +404,8 @@ class ADProgressionPrediction(BaseTask):
         time_feature: ``"to_target"`` (months from the visit to the target
             visit, the paper's feature), ``"since_previous"`` (months since
             the previous input visit) or ``"none"``.
-        drop_reverters: Drop subjects with explicit transition-string or
-            observed-stage reversions anywhere in their history. Default True.
+        drop_reverters: Drop subjects whose diagnosis ever reverts (the
+            paper's rule). Default ``True``.
         normalize: Z-score features with training statistics. Default
             ``True``.
         imputer: Optional callable that fills missing feature values of the
@@ -461,13 +455,8 @@ class ADProgressionPrediction(BaseTask):
         self.drop_reverters = bool(drop_reverters)
         self.normalize = bool(normalize)
         self.imputer = imputer
-        # Include the sample-layout version in BaseDataset's task cache key.
-        self._visit_mask_version = 1
+        # Part of BaseDataset's task cache key: a policy change rebuilds caches.
         self._sequence_policy_version = SEQUENCE_POLICY_VERSION
-        # Keep a fixed output space even when a small training fold lacks a class.
-        self._label_schema_version = 2
-        # Reject caches built when zero imputation concealed infinite values.
-        self._finite_values_version = 1
         self.input_schema = {
             "visits": (
                 "tensor",

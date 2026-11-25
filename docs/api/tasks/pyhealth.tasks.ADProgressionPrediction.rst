@@ -3,28 +3,16 @@ pyhealth.tasks.ADProgressionPrediction
 
 Next-visit Alzheimer's disease stage prediction (CN, MCI or AD) from a subject's earlier visits, with the stable and converter sequences of `Moghaddami et al. (CHIL 2025) <https://proceedings.mlr.press/v287/moghaddami25a.html>`_. Use with :class:`~pyhealth.datasets.TADPOLEDataset`.
 
-Samples include a boolean ``visits_mask`` alongside ``visits``. The dataloader
-pads this mask with False; ``VisitTransformer`` and PyHealth's ``RNN`` use it
-to distinguish real visits from padding even when normalized features are zero.
-Existing task caches are rebuilt for this sample layout.
+Each sample holds the input visits (``visits``, one row per visit), a
+``visits_mask`` that marks real visits after batch padding, and the
+diagnosis at the next visit (``label``, always encoded as CN=0, MCI=1, AD=2).
+Features are z-scored with statistics of the training split.
 
-The multiclass processor has a fixed output vocabulary: ``CN=0``, ``MCI=1``
-and ``AD=2``. All three outputs remain available when a small training fold
-lacks a diagnosis class. This uses the predefined clinical label space rather
-than validation/test labels; feature statistics are still fitted on training
-patients only. The label-schema cache version changes for this representation.
-
-Sequence policy version 2 checks both explicit transition strings and observed
-stage decreases for reversions before truncating at the first conversion.
-Visit preparation is shared by the task, experiment audit, and monthly baselines.
-
-Duplicate handling is a conservative team decision, not a procedure specified
-by the paper. Identical selected visit fields collapse to one record. Matching
-timestamps and nonempty visit codes allow complementary records to merge when
-all overlapping selected values agree. Conflicts or distinct visit codes at the
-same timestamp exclude the subject pending private source review. Unknown visit
-codes allow only exact duplicates to collapse. Original source events are kept
-unchanged, and the task cache key includes the new sequence policy version.
+The paper does not say how repeated records of one exam date are handled.
+:func:`~pyhealth.tasks.ad_progression.prepare_patient_visits` merges records
+of the same date and visit code when they agree, and drops the subject when
+they conflict or carry different visit codes. A transition string such as
+``"MCI to NL"`` counts as a reversion.
 
 .. autoclass:: pyhealth.tasks.ADProgressionPrediction
     :members:

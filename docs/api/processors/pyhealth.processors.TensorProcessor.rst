@@ -6,23 +6,6 @@ Processor for tensor data.
 ``size()`` returns the width of the feature's last dimension seen in ``fit()``
 (1 for scalars), or ``None`` before fitting.
 
-Non-finite measurements
------------------------
-
-NaN is a missing measurement. With ``impute_strategy="zero"``, only NaN is
-replaced by zero; positive and negative infinity retain their signs so models
-can validate invalid observations. Infinity is never silently converted to the
-largest finite value of the tensor dtype.
-
-When normalization is enabled, ``fit()`` rejects infinite training measurements
-before computing statistics. Non-finite fitted centers or scales also raise
-``ValueError``. Fitting consumes each training record once, including the first
-record used to infer shape, so single-pass iterators have the same statistics
-and validation as reusable collections. Held-out measurements do not refit these
-statistics. A downstream
-model such as ``VisitTransformer`` rejects infinity in retained visits while
-ignoring masked visits and history outside its configured window.
-
 Custom tensor processors
 ------------------------
 

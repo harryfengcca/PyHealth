@@ -27,6 +27,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import yaml
@@ -43,17 +44,50 @@ from pyhealth.datasets.tadpole import (
 from pyhealth.tasks import ADProgressionPrediction
 
 
-def _thread_cluster() -> contextlib.AbstractContextManager:
-    """Lets PyHealth's one-time event-table build use Dask threads.
+class _SynchronousClient:
+    """Stands in for a Dask cluster and client; computes in this thread."""
 
-    ``BaseDataset`` starts a Dask cluster of worker *processes* outside
-    notebooks; on five subjects their start-up dominates the build (about
-    1.5 s). Threads give the same table in about 0.7 s. Falls back to the
-    normal build if PyHealth no longer has the ``in_notebook`` switch.
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        """Accepts and ignores the cluster or client arguments."""
+
+    def __enter__(self) -> "_SynchronousClient":
+        """Returns itself, like ``LocalCluster`` and ``Client``."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Nothing to shut down."""
+
+    def compute(self, collection: Any) -> "_SynchronousClient":
+        """Runs ``collection`` with Dask's synchronous scheduler."""
+        collection.compute(scheduler="synchronous")
+        return self
+
+    def result(self) -> None:
+        """The computation already finished in :meth:`compute`."""
+
+
+def _synchronous_build() -> contextlib.AbstractContextManager:
+    """Builds PyHealth's event table without starting a Dask cluster.
+
+    ``BaseDataset`` writes the event table through a Dask ``LocalCluster``,
+    whose start-up and shutdown take about a second on five subjects. The
+    same Dask graph run with the synchronous scheduler takes milliseconds.
+    Falls back to the normal build if ``BaseDataset`` changes its imports.
     """
-    if hasattr(base_dataset, "in_notebook"):
-        return mock.patch.object(base_dataset, "in_notebook", return_value=True)
-    return contextlib.nullcontext()
+    names = ("DaskCluster", "DaskClient", "dask_progress")
+    if not all(hasattr(base_dataset, name) for name in names):
+        return contextlib.nullcontext()
+    stack = contextlib.ExitStack()
+    stack.enter_context(
+        mock.patch.object(base_dataset, "DaskCluster", _SynchronousClient)
+    )
+    stack.enter_context(
+        mock.patch.object(base_dataset, "DaskClient", _SynchronousClient)
+    )
+    stack.enter_context(
+        mock.patch.object(base_dataset, "dask_progress", lambda *a, **k: None)
+    )
+    return stack
 
 
 def _is_missing(value: object) -> bool:
@@ -64,8 +98,8 @@ def _is_missing(value: object) -> bool:
 class TestTADPOLEDataset(unittest.TestCase):
     """Loading and parsing of the five-subject fixture.
 
-    The dataset is built once for the class (under a second, see
-    :func:`_thread_cluster`), and every test below runs in milliseconds.
+    The dataset is built once for the class (see :func:`_synchronous_build`),
+    and every test below runs in milliseconds.
     """
 
     @classmethod
@@ -74,7 +108,7 @@ class TestTADPOLEDataset(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp()
         cls.csv_path = write_tadpole_fixture(cls.tmp)
         cls.dataset = TADPOLEDataset(root=cls.tmp, cache_dir=Path(cls.tmp) / "cache")
-        with _thread_cluster():
+        with _synchronous_build():
             _ = cls.dataset.unique_patient_ids  # build the event table once, here
 
     @classmethod

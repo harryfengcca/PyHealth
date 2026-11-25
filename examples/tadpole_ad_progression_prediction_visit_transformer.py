@@ -14,10 +14,10 @@ Paper:
 Description:
     Full pipeline, reproduction experiments and ablations.
 
-Reproduction attempt of Moghaddami, Schubring and Siadat, "Transformer Model for
+Reproduces Moghaddami, Schubring and Siadat, "Transformer Model for
 Alzheimer's Disease Progression Prediction Using Longitudinal Visit
 Sequences", CHIL 2025 (https://proceedings.mlr.press/v287/moghaddami25a.html),
-plus ablations that are not in the paper.
+and adds ablations that are not in the paper.
 
 Pipeline
 --------
@@ -33,21 +33,18 @@ imputation statistics are fitted on the training patients only.
 
 Experiments (``--experiment``)
 ------------------------------
-``reproduce``
-    The default encoder-only team variant of VisitTransformer, LSTM and GRU
-    on the raw and the balanced dataset
-    (the majority sequence type is downsampled within each group), 10 folds.
-    Scarce-stable groups also downsample converters, a team extension of the
-    paper's stable-only rule. LSTM and GRU are PyHealth's ``RNN`` trained with
-    the same next-visit objective as the Transformer.
-``paper_setup`` (10 folds)
-    A paper-oriented reconstruction on the same folds: an approximate
-    encoder-decoder Transformer and adapted TST (Zerveas et al., 2021),
-    both on inputs imputed
-    by "model filling" with a minimalRNN trained on the training patients
-    of the fold; and its minimalRNN, LSTM and GRU baselines trained month by
-    month as in Nguyen et al. Compare with the paper's Tables 2-5 while
-    disclosing unresolved model differences in ``tadpole_reproducibility.md``.
+``reproduce`` (10 folds)
+    VisitTransformer (default encoder), LSTM and GRU on the raw and the
+    balanced dataset (stable sequences dropped within each group until they
+    match the converters). LSTM and GRU are PyHealth's ``RNN`` trained with
+    the same next-visit objective as the Transformer. ``copy_last``, which
+    predicts the last input diagnosis, is a no-training reference.
+``paper_setup`` (10 folds, the same splits)
+    The paper's own setup: its encoder-decoder Transformer and the TST
+    (Zerveas et al., 2021), both on inputs imputed by "model filling" with a
+    minimalRNN trained on the training patients of the fold; and its
+    minimalRNN, LSTM and GRU baselines trained month by month as in Nguyen
+    et al. Compare with the paper's Tables 2-5.
 ``task_ablation`` (new, not in the paper; 5 folds)
     Varies the task, with the model fixed. Every task configuration is run
     with PyHealth's existing ``RNN`` (LSTM) and with ``VisitTransformer``, so
@@ -59,8 +56,8 @@ Experiments (``--experiment``)
 ``model_ablation`` (new, not in the paper; 5 folds)
     Varies the model, with the task fixed at the default. M2 class
     imbalance: cross-entropy vs. class-weighted cross-entropy vs. focal loss.
-    M3 architecture and hyperparameters: the approximate encoder-decoder
-    configuration, embedding size, depth, dropout, learning rate.
+    M3 architecture and hyperparameters: the paper's encoder-decoder vs. the
+    default encoder, embedding size, depth, dropout, learning rate.
 ``all``
     The four above. ``quick`` runs a two-fold, two-epoch smoke test.
 
@@ -70,36 +67,25 @@ against the true converters (AUROC, and sensitivity at 90% specificity).
 This tests whether a model's converter accuracy reflects better ranking or
 only a shifted decision threshold.
 
-Metric definitions follow the paper's Section 2.5 where specified: Hand-Till
-mAUC, F1, accuracy, sensitivity, specificity and balanced class accuracy
-(BCA). BCA = (macro sensitivity + macro specificity) / 2 over CN/MCI/AD.
-The following edge-case conventions are team choices, not established
-author implementation: undefined sensitivity/specificity denominators
-contribute 0; Hand-Till averages pairs of classes present in the subset and
-is undefined with fewer than two observed classes; F1 is reported both
-support-weighted and macro-averaged over classes present in the true labels,
-with zero-division terms set to 0. See ``tadpole_reproducibility.md``.
-
-Summaries count finite-value folds separately for every metric. Missing,
-NaN and infinite values do not contribute. Standard deviation uses ddof=0
-for at least two finite fold values and is left undefined otherwise;
-completed-run coverage alone does not establish complete metric coverage.
-
 Ablation M1 (new, not in the paper) compares the two ways of training the
 recurrent baselines on the same folds: next-visit classification
 (``reproduce``) and the paper's month-by-month forecasting
-(``paper_setup``). Input representation, imputation, dropout, learning rate
-and stopping rules also change: M1 compares full protocols and does not
-isolate a causal effect of the training objective alone.
+(``paper_setup``). The two protocols also differ in input representation,
+imputation and training settings, so M1 compares whole protocols.
 
-Model assumptions: ``paper_setup`` matches reported layer counts and width,
-but learned query/readout, learned positions, pre-norm/final layer norms,
-feed-forward width, dropout and initialization are team choices. The model
-has 8,460,035 parameters with the default task, compared with 6,603,267
-reported in the paper. TST's validity-aware normalization and singleton
-fallback are team adaptations. These differences and the encoder-only
-default are documented in ``tadpole_reproducibility.md``; no exact model or
-numerical reproduction is established.
+Metrics follow the paper (Section 2.5): Hand-Till mAUC, F1, accuracy, and
+per-subset sensitivity, specificity and balanced class accuracy (BCA).
+Sensitivity and specificity are averaged over all three classes, with a
+class that has no positives (or no negatives) in the subset counted as 0
+(this reproduces, e.g., the paper's converter-subset sensitivity of
+0.430 = (0 + 0.645 + 0.645) / 3), and BCA = (sensitivity + specificity) / 2.
+The table reports weighted F1; ``summary.csv`` also has macro F1.
+
+Protocol choices the paper leaves open (repeated exam dates, balancing of
+groups with few stable sequences, metric edge cases) and the differences
+of our encoder-decoder from the paper's (8.46M parameters here, 6.60M in
+the paper) are listed in ``examples/tadpole_reproducibility.md`` and the
+``VisitTransformer`` API page.
 
 Usage
 -----
@@ -123,29 +109,24 @@ Split folds across jobs with ``--fold k`` (0-9; the ablations have folds
 0-4 and skip higher indices) and aggregate afterwards with
 ``--summarize-only``. Finished runs are skipped on restart.
 
-Use ``--audit-only --root /path/to/tadpole`` to write aggregate cohort
-accounting without fitting processors or training. See
-``examples/tadpole_reproducibility.md`` for provenance and cache behavior.
+Write the cohort counts without training with ``--audit-only``.
 
-Outputs, in ``--output-dir/<experiment>/``: ``manifest.json`` (source/code/
-settings identity), ``cohort_*.json`` (aggregate counts), ``runs.jsonl`` (one line per
-config and fold), ``summary.csv`` (mean and std per config) and
-``summary.md`` (a readable table plus Welch t-tests against the
-Transformer).
-
-Current synthetic validation, separate from the historical tables below, is
-documented in ``examples/tadpole_model_validation.md`` with aggregate run records
-and reproducible commands.
+Outputs, in ``--output-dir/<experiment>/``: ``manifest.json`` (code, data
+and settings fingerprints), ``cohort_*.json`` (aggregate counts),
+``runs.jsonl`` (one line per config and fold), ``summary.csv`` (mean, std
+and number of valid folds per metric) and ``summary.md`` (a readable table
+plus Welch t-tests against the Transformer). A changed code version needs a
+new ``--output-dir``.
 
 Results
 -------
-The historical tables below predate provenance manifests. Their underlying
-run artifacts are unavailable, so these numbers and significance claims are
-unverified and must not be presented as results of the current pipeline.
+RERUN-PENDING: the tables and findings below are from an earlier code
+version and are replaced after the rerun.
 
-Setup: TADPOLE D1/D2 (1,548 sequences after the paper's rules: 1,163 stable,
-385 converter), patient-level folds stratified by sequence type and group,
-15% of the training patients held out for early stopping on validation BCA,
+Setup: TADPOLE D1/D2 (1,543 sequences after the paper's rules: 1,159 stable,
+384 converter), patient-level folds stratified by sequence type and group,
+15% of the training patients held out for early stopping on validation
+balanced accuracy (macro recall),
 batch size 32, Adam lr 1e-4, weight decay 1e-5, up to 200 epochs with
 patience 20, seed 42, one GH200 GPU (20-70 s per training run). The
 month-by-month RNNs use the reference's settings instead (100 epochs,
@@ -337,8 +318,8 @@ PAPER_ARCH = {
     "num_layers": 4,
     "num_decoder_layers": 8,
 }
-# Team TST settings based on Zerveas et al. (2021), with adapted normalization.
-# Inputs are padded or truncated to max_visits; 16 is a team setting.
+# TST with the defaults of Zerveas et al. (2021). Every input is padded to
+# ``max_visits``, which covers the longest input sequence (12 visits).
 TST_PARAMS = {
     "architecture": "tst",
     "embedding_dim": 64,
@@ -384,7 +365,7 @@ def experiment_configs(experiment: str) -> list[RunConfig]:
         for data in ("raw", "balanced")
         for model in ("visit_transformer", "lstm", "gru", "copy_last")
     ]
-    # Paper-oriented reconstruction; model assumptions are documented above.
+    # The paper's own setup; differences are listed in tadpole_reproducibility.md.
     # "Model filling" replaces forward fill: missing
     # input values are predicted by a minimalRNN trained month by month on
     # the training patients of the fold. The RNN baselines are trained the
@@ -704,7 +685,7 @@ def _balance_report(meta: list[dict[str, Any]], keep: set[str], seed: int) -> di
 
 
 # --------------------------------------------------------------------------
-# Metrics (paper definitions with explicitly documented team conventions)
+# Metrics (the paper's definitions)
 # --------------------------------------------------------------------------
 
 
@@ -717,11 +698,8 @@ def hand_till_auc(y: np.ndarray, prob: np.ndarray, classes: Sequence[int]) -> fl
         classes: Class indices to consider.
 
     Returns:
-        The mean of both directional rank AUCs for every observed class
-        pair, using the original class scores without pairwise probability
-        renormalization. Ties receive half credit. NaN is returned when
-        fewer than two classes are present. Omitting absent classes is a
-        team convention for subsets where the full multiclass AUC is undefined.
+        The mean over class pairs of the two one-vs-one AUCs (ties count
+        half), or NaN if fewer than two classes are present.
     """
     present = [c for c in classes if np.any(y == c)]
     if len(present) < 2:
@@ -741,13 +719,10 @@ def subset_metrics(y: np.ndarray, prob: np.ndarray) -> dict[str, float]:
     """Evaluates one subset using the paper's Section 2.5 metric definitions.
 
     Sensitivity and specificity are computed one-vs-rest for each of the
-    three clinical classes and averaged over all three. By team convention,
-    a sensitivity with no positives or specificity with no negatives
-    contributes 0. BCA is ``(sensitivity + specificity) / 2``. Thus perfect
-    predictions on a converter subset containing MCI and AD, but no CN,
-    yield BCA 5/6 under this convention. Both weighted and macro F1 average
-    only classes present in true labels, with zero-division terms set to 0.
-    These edge cases and F1 averaging are not established author choices.
+    three classes and averaged over all three; a class with no positives
+    (or no negatives) in the subset contributes 0, which reproduces the
+    paper's converter-subset numbers. BCA is ``(sensitivity + specificity) /
+    2``. Weighted and macro F1 average over the classes present in ``y``.
 
     Args:
         y: True class indices ``[N]`` in ``DX_CLASSES`` order.

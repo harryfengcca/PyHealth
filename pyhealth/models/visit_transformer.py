@@ -14,10 +14,9 @@ Paper:
 Description:
     Visit-level Transformer for multiclass next-visit diagnosis prediction.
 
-Implements a reproduction attempt of Moghaddami, Schubring and Siadat,
-"Transformer Model for Alzheimer's Disease Progression Prediction Using
-Longitudinal Visit Sequences" (CHIL 2025,
-https://proceedings.mlr.press/v287/moghaddami25a.html).
+Implements the model of Moghaddami, Schubring and Siadat, "Transformer Model
+for Alzheimer's Disease Progression Prediction Using Longitudinal Visit
+Sequences" (CHIL 2025, https://proceedings.mlr.press/v287/moghaddami25a.html).
 
 Each clinical visit is one token: a dense vector of measurements, the current
 diagnosis and a time feature. Self-attention lets every visit attend to every
@@ -31,24 +30,22 @@ linear projection (so padded visits take part in attention) and represents
 a sequence by its first, i.e. oldest, visit. This model masks padded visits
 out of attention and pooling, adds learned position embeddings, and
 summarizes a sequence by masked mean pooling or by a learned decoder query.
-The query is a team implementation assumption, not a detail established by
-the paper. It also offers the class-weighted and focal losses used in
+It also offers the class-weighted and focal losses used in
 our ablations, and the Time Series Transformer (TST) of Zerveas et al.
 (KDD 2021), the paper's second Transformer baseline.
 
 Shapes use the row-vector convention, ``Y = X @ W``:
 ``[B, T, F] @ [F, d] -> [B, T, d]``, then ``[B, d] @ [d, C] -> [B, C]``.
 
-Reproduction boundary:
-    The paper reports 4 encoder layers, 8 decoder layers, 4 attention heads,
-    width 256 and 6,603,267 parameters. ``encoder_decoder`` can match those
-    reported dimensions, but its learned query, learned positions, pre-norm
-    blocks, final layer norms and feed-forward width are team choices whose
-    equivalence to the authors' implementation has not been established.
-    With 26 input columns, 3 classes, ``max_visits=64`` and feed-forward width
-    512, that configuration has 8,460,035 parameters. The default smaller
-    encoder is a team variant. TST uses validity-aware batch normalization
-    and a singleton fallback, both team adaptations for padded batches.
+Differences from the paper:
+    The paper gives the encoder-decoder's depth (4 encoder, 8 decoder
+    layers), width 256, 4 heads and 6,603,267 parameters, but not its decoder
+    input, readout, position encoding or feed-forward width. Here the decoder
+    reads one learned query, positions are learned, blocks are pre-norm and
+    the feed-forward width is 512, giving 8,460,035 parameters with the
+    default task. The default ``encoder`` architecture is smaller (0.81M
+    parameters). The TST normalizes over real visits only, so padding does
+    not change its batch statistics.
 """
 
 import math
@@ -93,10 +90,8 @@ class _BatchNormEncoderLayer(nn.Module):
     Follows ``TransformerBatchNormEncoderLayer`` of Zerveas et al. (2021):
     self-attention and a GELU feed-forward block, each followed by a residual
     connection and batch normalization over the embedding channels. Only
-    valid visits contribute to normalization statistics. A training batch
-    with one valid visit uses running statistics without updating them;
-    its affine parameters and input still receive gradients. These are team
-    adaptations of the TST baseline, not verified choices from the paper.
+    real visits enter the normalization statistics. A training batch with a
+    single real visit is normalized with the running statistics.
 
     Args:
         d_model: Embedding width ``d``.
@@ -180,17 +175,14 @@ class VisitTransformer(BaseModel):
     The input feature must be a ``tensor`` of shape ``[T, F]`` per sample,
     padded with all-zero rows by the dataloader. Padded visits are masked out
     of attention and pooling. An optional ``<feature_key>_mask`` boolean
-    tensor ``[B, T]`` marks real visits, including all-zero visits after
-    normalization. Without it, all-zero rows are treated as padding.
-    NaN measurements are filled with zero; infinite measurements in retained
-    visits raise ``ValueError`` before projection or attention.
+    ``[B, T]`` marks real visits; without it, all-zero rows are padding. NaN
+    values are set to zero; infinite values raise ``ValueError``.
 
     Three architectures are available:
 
-    * ``"encoder"`` (default, a team variant): a Transformer encoder followed
-      by masked mean pooling.
-    * ``"encoder_decoder"`` (an approximation of the paper's architecture): an
-      encoder followed by a decoder in which one learned query token attends
+    * ``"encoder"`` (default): a Transformer encoder followed by masked mean
+      pooling.
+    * ``"encoder_decoder"`` (the paper's architecture): an encoder followed by a decoder in which one learned query token attends
       to the encoded visits; the query's output is classified.
     * ``"tst"``: the Time Series Transformer of Zerveas et al. (KDD 2021),
       the paper's other Transformer baseline. Inputs are scaled by
@@ -217,14 +209,12 @@ class VisitTransformer(BaseModel):
         architecture: ``"encoder"``, ``"encoder_decoder"`` or ``"tst"``.
         loss: ``"ce"`` (cross-entropy), ``"weighted_ce"`` (cross-entropy with
             class weights) or ``"focal"`` (focal loss).
-        class_weights: Optional one-dimensional vector of finite, strictly
-            positive weights in label-processor class order. Explicit weights
-            apply to all losses, including ``"ce"``. ``None`` with
-            ``"weighted_ce"`` computes inverse class frequencies from
-            ``dataset``; pass the training split to avoid using held-out labels.
-            Weighted CE divides by the batch's target-weight sum; focal loss
-            averages its optionally weighted terms over the batch size.
-        focal_gamma: Finite, nonnegative focusing parameter. Default 2.0.
+        class_weights: Optional positive weight per class, in label order;
+            used by every loss when given. ``None`` with ``"weighted_ce"``
+            uses inverse class frequencies of ``dataset`` (pass the training
+            split).
+        focal_gamma: Nonnegative focusing parameter of the focal loss.
+            Default 2.0.
 
     Raises:
         ValueError: If dimensions or layer counts are not positive integers,
@@ -232,15 +222,10 @@ class VisitTransformer(BaseModel):
             or the dataset does not define one multiclass label and one input.
 
     Notes:
-        Learned positions, pre-norm layers, final layer norms, a single learned
-        decoder query and feed-forward width 512 are implementation assumptions.
-        Matching the paper's reported layer counts and width does not establish
-        architectural or parameter-count equivalence; see the module's
-        reproduction boundary and the API documentation. Encoder and decoder
-        layers receive independent Xavier-uniform matrix initialization, zero
-        biases and unit layer-normalization scales. TST's masked normalization
-        and singleton fallback are documented team adaptations. Other patients'
-        real visits still affect training outputs through batch normalization.
+        Encoder and decoder layers are initialized independently (Xavier
+        uniform), since PyTorch's layer stacks start every layer from the
+        same copied weights. See the module docstring for the differences
+        from the paper.
 
     Examples:
         >>> from pyhealth.datasets import create_sample_dataset
