@@ -165,8 +165,9 @@ Next-visit training (10 folds, the same splits)::
     GRU (PyHealth RNN)   balanced   .909  .851  .829   .809   .680   .859
 
 Findings. (1) The paper's comparison reproduces: with the paper's setup,
-the Transformer's converter accuracy (.604 raw, .783 balanced) is within
-fold noise of the paper's (.648, .792; one-sample t-test p = .31, .71),
+the Transformer's converter accuracy (.604 raw, .783 balanced) is not
+significantly different from the paper's (.648, .792; one-sample t-test
+p = .31, .71),
 it beats every month-by-month RNN on converter accuracy (p < 1e-4) and
 BCA (p <= .014; Welch's t-test), and the RNNs keep a stable accuracy of
 .98-.99, as in the paper. (2) mAUC is higher than the paper's for every
@@ -175,11 +176,14 @@ model (+.02 to +.07), likely because of our random patient-level folds
 patients. (3) Converter sensitivity is lower (.28 vs .43): CN-to-MCI
 conversions, 22% of our converters (17% in the paper), are rarely
 predicted (sensitivity .07, vs .76 for MCI-to-AD). (4) The TST and the
-paper's Transformer do not differ (p > .45); the paper reports a higher
-TST converter accuracy (.694). (5) Ablation M1 (new): on the same folds,
-the same LSTM and GRU trained as next-visit classifiers reach converter
-accuracy .64-.66 instead of .11-.22 (paired t-test, p < 2e-6) and match
-VisitTransformer on every metric (Welch p > .17). The paper's
+paper's Transformer show no significant difference (p > .45); the paper
+reports a higher TST converter accuracy (.694). (5) Ablation M1 (new): on
+the same folds, the same LSTM and GRU trained as next-visit classifiers
+reach converter accuracy .64-.66 instead of .11-.22 (paired t-test,
+p < 2e-6) and show no significant difference from VisitTransformer on
+any metric (Welch p >= .09). With 10 folds this is not proof of
+equivalence: the 90% confidence interval of the RNN minus Transformer
+converter accuracy reaches -.06, far smaller than the protocol's effect. The paper's
 Transformer-RNN gap comes from the month-by-month training, which mostly
 keeps the current diagnosis (its BCA is .01-.02 above copying the last
 diagnosis), not from recurrence.
@@ -196,8 +200,9 @@ Task ablation (new; 5 folds; the same splits for both models)::
     T2b months since previous visit    .875  .599  .853   .885  .612  .845
     T3  keep reverters                 .845  .638  .851   .846  .664  .853
 
-Findings. Both models respond the same way and never differ from each
-other (paired p >= .07). Missing-value indicators give the largest gain
+Findings. Both models respond in the same direction to every change, and
+no configuration shows a significant difference between them (paired
+p >= .07). Missing-value indicators give the largest gain
 (Transformer converter accuracy +.047, p = .06); dropping forward fill
 costs converter accuracy (-.02 LSTM, -.05 Transformer). The time feature
 does not matter: removing it, or replacing "months to target" by "months
@@ -220,8 +225,8 @@ Model ablation (new; 5 folds; VisitTransformer, task T0)::
     M3f learning rate 1e-3            0.81M  .884  .915   .620   .859
 
 Findings. No variant differs from the default by more than .005 BCA
-(paired p >= .18): the paper's 8.46M-parameter encoder-decoder is no
-better than a 0.34M-parameter encoder on 1.5k sequences, and re-weighted
+(paired p >= .18): the paper's 8.46M-parameter encoder-decoder is not
+significantly better than a 0.34M-parameter encoder on 1.5k sequences, and re-weighted
 losses do not raise converter accuracy. T0 and M0 are the same
 configuration and give identical numbers, which confirms that runs are
 deterministic for a given seed and split.

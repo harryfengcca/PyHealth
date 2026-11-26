@@ -18,6 +18,20 @@ Three architectures are available:
 
 Losses are cross-entropy, class-weighted cross-entropy and focal loss.
 
+Compared with ``pyhealth.models.Transformer``
+---------------------------------------------
+
+:class:`~pyhealth.models.Transformer` also accepts dense tensors, but it is
+built for code sequences. On visit vectors it has no position encoding, so
+visit order is invisible to it; it infers padding after a biased projection,
+so padded visits are never masked; and it summarizes a sequence by its first,
+i.e. oldest, visit. ``VisitTransformer`` adds position embeddings, masks
+padded visits out of attention, pooling and normalization, and summarizes a
+sequence by masked mean pooling, a learned decoder query or (TST) all visit
+states. No other PyHealth prediction model offers the paper's encoder-decoder
+or the TST. A separate class keeps the existing ``Transformer`` unchanged for
+the tasks that use it.
+
 Differences from the paper
 --------------------------
 

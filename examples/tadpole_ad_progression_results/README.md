@@ -18,26 +18,57 @@ holds aggregate results only; ADNI data is not redistributed.
   Transformer recognizes converters far better than the RNNs (accuracy .60 vs
   .09-.22 on the raw data; p < 1e-4), while the RNNs are near-perfect on
   stable subjects (.98-.99), as in the paper. Our Transformer's converter
-  accuracy (.604 raw, .783 balanced) is within fold-to-fold noise of the
+  accuracy (.604 raw, .783 balanced) is not significantly different from the
   paper's (.648, .792; one-sample t-test p = .31 and .71), and overall BCA is
   within .01 of the paper's.
 - **The gap is the training protocol, not recurrence (ablation M1).** The
   same LSTM and GRU trained as next-visit classifiers, like the Transformer,
   reach converter accuracy .64-.66 on the raw data (vs .11-.22 month by
-  month; paired p < 2e-6) and match the Transformer on every metric
-  (Welch p > .17).
+  month; paired p < 2e-6) and show no significant difference from the
+  Transformer on any metric (Welch p >= .09). With 10 folds this does not
+  prove equivalence (see *Statistical tests*), but the RNNs are at most .06
+  worse on converter accuracy, a small fraction of the .41-.58 that the
+  training protocol changes.
 - **Month-by-month RNNs mostly copy the last diagnosis.** Their overall BCA
   (.84-.85 raw) is barely above a no-training "copy last diagnosis" baseline
   (.83), but they still rank converters reasonably (T4 AUROC .74-.82).
 - **Task and model ablations change little.** Apart from keeping reverters
   (-.035 BCA, because reverters enter the test set), no task change moves BCA
   by more than .006. Missing-value indicators add .047 converter accuracy for
-  the Transformer (p = .06). The 8.46M-parameter encoder-decoder is no better
-  than a 0.34M-parameter encoder.
+  the Transformer (p = .06). The 8.46M-parameter encoder-decoder is not
+  significantly better than a 0.34M-parameter encoder.
 - **What we could not match:** converter sensitivity and BCA are lower than
   the paper's (.28 vs .43 raw), mostly because CN-to-MCI conversions are
   rarely predicted (sensitivity .07); the TST is not better than the
   Transformer (the paper reports .694 vs .648 converter accuracy).
+
+## Why a new model
+
+The paper's model is a Transformer over **dense visit vectors** (each visit is
+a vector of measurements) with an **encoder-decoder** readout. PyHealth's
+existing `pyhealth.models.Transformer` accepts dense tensors too, but it is
+built for sequences of medical codes, and three of its choices do not fit
+visit sequences:
+
+| | `pyhealth.models.Transformer` | `VisitTransformer` |
+|---|---|---|
+| Visit order | No position encoding: the model cannot tell which visit came first | Learned position embeddings (sinusoidal in the TST) |
+| Padding | The mask is inferred after a biased linear projection, so padded visits are never masked and take part in attention | Padded visits are masked out of attention, pooling and normalization, from an explicit `visits_mask` or from all-zero rows |
+| Sequence summary | The first token, i.e. the **oldest** visit | Masked mean over visits (`encoder`), a learned query that attends to all visits (`encoder_decoder`), or all visit states concatenated (`tst`) |
+| Architectures | Encoder only | `encoder`, the paper's `encoder_decoder` (4 encoder + 8 decoder layers), and `tst`, the paper's second Transformer baseline |
+| Class imbalance | Cross-entropy | Cross-entropy, class-weighted cross-entropy, focal loss |
+
+No PyHealth prediction model offers an encoder-decoder over visit sequences
+(PromptEHR uses one to generate synthetic records) or the Time Series
+Transformer, so reproducing the paper's two Transformers needs a new model.
+Changing `Transformer` instead would alter the outputs of an existing model
+that other tasks and examples rely on. One `VisitTransformer` class covers
+the three architectures the paper compares, so they share the same masking,
+input checks and losses, and differ only in the part the paper compares.
+
+We did not benchmark PyHealth's `Transformer` on this task; the comparison
+above is about design. Within `VisitTransformer`, the model ablation compares
+the encoder-decoder with the smaller encoder.
 
 ## Running
 
@@ -75,16 +106,31 @@ without a diagnosis are discarded, and each subject gives one sequence. Two
 cases the paper does not cover:
 
 - repeated records of one exam date are merged when they agree; the subject is
-  dropped when they conflict or carry different visit codes (3 of 1,737
-  subjects);
+  dropped when they conflict or carry different visit codes;
 - transition strings such as `"MCI to NL"` count as reversions even when the
-  visit diagnoses alone do not show one (3 more subjects).
+  visit diagnoses alone do not show one.
 
-This gives **1,543 sequences (1,159 stable, 384 converter)**; the paper
-reports 1,627 (1,222 stable, 405 converter). Of our converters, 81 convert
-from CN to MCI and 3 from CN to AD (22%); the paper reports 70 CN-to-MCI
-conversions (17%). Counts by exclusion reason, history group and transition
-are in `cohort.json`.
+Every subject of `TADPOLE_D1_D2.csv` is accounted for (each counted under the
+first rule that excludes it; `cohort.json` has the same counts):
+
+| Step | Subjects |
+|---|---|
+| Subjects in TADPOLE D1/D2 | 1,737 |
+| Fewer than two visits | -70 |
+| Conflicting or ambiguous records on one exam date | -3 |
+| Reverters (100 from the visit diagnoses, 3 more only from transition strings) | -103 |
+| Fewer than two visits with a diagnosis | -18 |
+| **Sequences** | **1,543** (1,159 stable, 384 converter) |
+
+The paper reports 1,627 sequences (1,222 stable, 405 converter) but not how
+many subjects each rule removes, so the gap of 84 cannot be fully explained.
+Our two extra rules remove only 6 subjects, and keeping subjects with fewer
+than two diagnosed visits would add at most 18 more, which leaves at least 60
+sequences unexplained. Likely sources are a different release of the ADNI
+data or a different reading of the reversion rule. The share of converters is
+the same (24.9% in both), but the mix differs: 81 of our converters go from
+CN to MCI and 3 from CN to AD (22%), against 70 CN-to-MCI conversions (17%)
+in the paper.
 
 **Balanced data.** Within each history group (number of input visits),
 stable sequences are dropped at random until they match the converters, as in
@@ -113,6 +159,49 @@ sensitivity for the RNNs (.30-.33) with their converter accuracy (.13-.22)
 under any averaging, so **converter accuracy is our main converter metric**.
 T4 (ours) is converter detection: among subjects not yet at AD, the AUROC of
 the probability of a more severe stage than the current one.
+
+**Missing values.** Each experiment fills missing measurements in the input
+visits as follows (the target visit is never an input):
+
+| Experiment | Models | Missing-value handling |
+|---|---|---|
+| `paper_setup` | Transformer (encoder-decoder), TST | "Model filling" (paper, Section 2.2): a minimalRNN trained on the fold's training patients predicts each missing value from the earlier months |
+| `paper_setup` | minimalRNN, LSTM, GRU (month by month) | Inside the model, as in Nguyen et al.: a missing value is replaced by the model's own prediction for that month |
+| `reproduce` | VisitTransformer, LSTM, GRU | Forward fill within the patient; values never observed before a visit get the training mean (zero after z-scoring) |
+| `task_ablation` | LSTM, VisitTransformer | T0, T2, T3: forward fill. T1a: no forward fill (training mean). T1b: forward fill plus a missing-value indicator per feature |
+| `model_ablation` | VisitTransformer | Forward fill (task T0) |
+| all | Copy last diagnosis | Uses only the last diagnosis, which is never missing |
+
+**Leakage checks.** Nothing fitted on data uses validation or test patients:
+
+- *Normalization and imputation.* Every fold calls
+  `dataset.set_task(task, split=...)`, which fits the z-score statistics (and
+  the training means used for imputation) on the training patients only and
+  applies them unchanged to validation and test. The month-by-month RNNs fit
+  their standardization on the training patients too.
+- *Model filling.* The minimalRNN filler is trained on the fold's training
+  patients only. It fills each patient's input visits from that patient's own
+  earlier inputs (at the first visit, from the first observed input value)
+  and never sees the target visit. Forward fill likewise only carries values forward from
+  earlier visits of the same patient.
+- *Splits.* Each patient gives exactly one sequence, so splitting sequences
+  is splitting patients. In every fold, training + validation + test is the
+  whole cohort (1,543 raw, 764 balanced) with no overlap, and the ten test
+  folds together contain every patient once.
+- *Model selection.* Early stopping uses a validation set taken from the
+  training patients; the test fold is only used for the final evaluation.
+  Hyperparameters are fixed (the paper's where it reports them, otherwise
+  one default setting), and every configuration we ran is reported.
+- *Features.* The time feature ("months to the target visit") is the paper's
+  design: the prediction horizon is known when a prediction is made, and it
+  does not reveal the target diagnosis.
+
+**Statistical tests.** Comparisons use Welch's t-test across folds (paired
+t-tests where noted, as all models share the same folds). With 10 folds (5
+for the ablations), a p-value above .05 means no difference was detected, not
+that the models perform the same. Where we compare models of interest we also
+give 90% confidence intervals of the difference, which show how large a
+difference the data still allow.
 
 ## Reproduction: the paper's setup (10 folds)
 
@@ -157,17 +246,18 @@ RNNs, so those cells are left out):
 ![Paper setup, raw](figures/fig1_paper_setup_raw.png)
 ![Paper setup, balanced](figures/fig1_paper_setup_balanced.png)
 
-- Converter accuracy matches the paper for the Transformer (.604 vs .648, p =
-  .31; balanced .783 vs .792) and for the RNNs within .00-.09; stable accuracy
-  matches for every model.
+- Converter accuracy is close to the paper's for the Transformer (.604 vs
+  .648, not significantly different, p = .31; balanced .783 vs .792) and
+  within .00-.09 for the RNNs. Stable accuracy is within .01 for the RNNs and
+  higher than the paper's for the Transformer (+.03) and the TST (+.07).
 - The Transformer beats every month-by-month RNN on converter accuracy (p <
   1e-4) and BCA (p <= .014), on both datasets (Welch's t-test, 10 folds).
 - mAUC is higher than the paper's for every model (by .02-.07), and so is
-  overall BCA on the raw data (by .01-.02). Likely causes: our random patient-level folds instead of the paper's
-  temporal split, a held-out validation set for early stopping, and a
-  slightly different cohort.
-- The TST and the paper's Transformer do not differ on any tested metric (p >
-  .45); the paper reports a higher converter accuracy for the TST (.694; ours
+  overall BCA on the raw data (by .01-.02). Likely causes: our random
+  patient-level folds instead of the paper's temporal split, a held-out
+  validation set for early stopping, and a slightly different cohort.
+- The TST and the paper's Transformer show no significant difference on any
+  tested metric (p > .45); the paper reports a higher converter accuracy for the TST (.694; ours
   .607).
 
 ## Reproduction: next-visit training (10 folds)
@@ -215,11 +305,46 @@ paper's baselines) or as next-visit classifiers (as the Transformer).
 
 Next-visit training raises converter accuracy by .41-.58 (paired t-test, p <
 2e-6) and BCA by .03-.09 (p <= .002), at the cost of stable accuracy (-.07 to
--.15). Trained this way, LSTM and GRU are indistinguishable from the
-Transformer (Welch p > .17 on mAUC, BCA, converter accuracy and converter
-BCA). **The paper's Transformer-vs-RNN gap comes from how the baselines are
+-.15). Trained this way, LSTM and GRU show no significant difference from
+the Transformer on any metric (table below). **The paper's Transformer-vs-RNN gap comes from how the baselines are
 trained**: month-by-month forecasting mostly keeps the current diagnosis
 (CN-to-MCI sensitivity 0 and MCI-to-AD .27 for the LSTM on the raw data).
+
+Next-visit RNNs vs. VisitTransformer on every metric (10 folds; Δ = RNN minus
+VisitTransformer, with its 90% confidence interval and Welch's t-test):
+
+Raw dataset:
+
+| Metric | VisitTransformer | LSTM | Δ LSTM (90% CI) | p | GRU | Δ GRU (90% CI) | p |
+|---|---|---|---|---|---|---|---|
+| mAUC | .956 | .952 | -.003 [-.015, +.009] | 0.64 | .955 | -.001 [-.012, +.010] | 0.87 |
+| F1 | .835 | .837 | +.002 [-.030, +.034] | 0.91 | .835 | +.001 [-.028, +.029] | 0.98 |
+| Accuracy | .839 | .842 | +.003 [-.026, +.032] | 0.88 | .839 | +.000 [-.026, +.026] | 1.00 |
+| BCA | .884 | .885 | +.001 [-.018, +.020] | 0.93 | .883 | -.001 [-.019, +.017] | 0.94 |
+| Stable acc. | .914 | .902 | -.012 [-.042, +.018] | 0.50 | .907 | -.007 [-.033, +.019] | 0.65 |
+| Conv. acc. | .615 | .662 | +.047 [-.025, +.119] | 0.27 | .636 | +.021 [-.041, +.083] | 0.57 |
+| Conv. BCA | .566 | .593 | +.027 [-.007, +.062] | 0.19 | .577 | +.011 [-.014, +.037] | 0.45 |
+| Conv. sens. | .277 | .312 | +.035 [-.011, +.080] | 0.20 | .292 | +.015 [-.019, +.050] | 0.45 |
+| T4 AUROC | .856 | .855 | -.001 [-.037, +.035] | 0.97 | .862 | +.006 [-.027, +.040] | 0.74 |
+
+Balanced dataset:
+
+| Metric | VisitTransformer | LSTM | Δ LSTM (90% CI) | p | GRU | Δ GRU (90% CI) | p |
+|---|---|---|---|---|---|---|---|
+| mAUC | .910 | .904 | -.006 [-.029, +.016] | 0.62 | .909 | -.002 [-.025, +.022] | 0.90 |
+| F1 | .783 | .791 | +.008 [-.049, +.065] | 0.82 | .809 | +.025 [-.024, +.075] | 0.39 |
+| Accuracy | .800 | .805 | +.005 [-.045, +.056] | 0.86 | .819 | +.020 [-.026, +.065] | 0.46 |
+| BCA | .837 | .839 | +.002 [-.032, +.035] | 0.93 | .851 | +.014 [-.018, +.045] | 0.46 |
+| Stable acc. | .814 | .809 | -.005 [-.055, +.044] | 0.85 | .829 | +.015 [-.038, +.068] | 0.62 |
+| Conv. acc. | .785 | .801 | +.016 [-.061, +.093] | 0.73 | .809 | +.024 [-.040, +.087] | 0.52 |
+| Conv. BCA | .654 | .679 | +.025 [-.017, +.068] | 0.32 | .680 | +.026 [-.006, +.058] | 0.17 |
+| Conv. sens. | .384 | .430 | +.046 [-.013, +.106] | 0.19 | .429 | +.046 [+.002, +.089] | 0.09 |
+| T4 AUROC | .847 | .844 | -.002 [-.046, +.041] | 0.92 | .859 | +.012 [-.031, +.055] | 0.64 |
+
+No difference is significant at .05. The intervals are narrow for mAUC and
+overall BCA (within about ±.035) but wide for the converter metrics (up to
+±.08), so the data rule out a large Transformer advantage on converters
+without proving that the models are equivalent.
 
 **Copy-last baseline and T4.** Predicting the last input diagnosis gives BCA
 .831 (raw) and .703 (balanced) with no training; the month-by-month RNNs are
@@ -255,8 +380,9 @@ months to the target visit as the time feature, reverters dropped.
 - **T3 label definition.** Keeping reverters lowers BCA by .035 (p <= .02)
   for both models, because the test set then contains reverters, of which the
   models get only 28% right: they rarely predict an improving diagnosis.
-- The two models respond the same way; under every configuration their BCA
-  and converter accuracy do not differ (paired p >= .07).
+- The two models respond in the same direction to every change, and under
+  every configuration their BCA and converter accuracy show no significant
+  difference (paired p >= .07).
 
 ## Model ablation (new; 5 folds, VisitTransformer, task T0)
 
@@ -276,7 +402,7 @@ months to the target visit as the time feature, reverters dropped.
 
 No variant differs from the default by more than .005 BCA (paired p >= .18).
 The paper's encoder-decoder (8.46M parameters here; the paper reports 6.60M
-with an unreported feed-forward width) is no better than a 0.34M-parameter
+with an unreported feed-forward width) is not significantly better than a 0.34M-parameter
 encoder on 1,543 sequences. Class-weighted and focal losses do not raise
 converter accuracy. T0 and M0 are the same configuration and give identical
 numbers, which confirms that runs are deterministic for a given seed and
