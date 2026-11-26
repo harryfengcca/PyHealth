@@ -17,15 +17,22 @@ Description:
 Runs data loading (TADPOLEDataset) -> task processing
 (ADProgressionPrediction) -> model training (VisitTransformer, PyHealth's
 LSTM and GRU, and the paper's TST and month-by-month RNN baselines) ->
-evaluation, for the reproduction, the paper's setup and every ablation.
+evaluation, for the reproduction, the paper's setup and every ablation
+(``--experiment all``).
 
-Synthetic data, no ADNI access needed::
+Synthetic data, no ADNI access needed: every experiment runs with 2 folds
+and 2 training epochs, 78 runs in about two minutes on a CPU. The numbers
+only show that the pipeline runs end to end::
 
     python examples/my_replication.py
 
-Real TADPOLE data on a GPU (all arguments are passed through)::
+Real TADPOLE data on a GPU, with the full settings (10 folds, 5 for the
+ablations, up to 200 epochs)::
 
     python examples/my_replication.py --root /path/to/tadpole --device cuda
+
+Any argument of the pipeline script can be passed and overrides these
+defaults, for example ``--experiment quick``.
 
 See ``tadpole_ad_progression_prediction_visit_transformer.py`` for details.
 """
@@ -42,6 +49,23 @@ if __name__ == "__main__":
     pipeline = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pipeline)
     argv = sys.argv[1:]
-    if "--experiment" not in argv:
-        argv += ["--experiment", "all" if "--root" in argv else "quick"]
+
+    def given(flag: str) -> bool:
+        """Whether ``flag`` is on the command line, as ``--x v`` or ``--x=v``."""
+        return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+    defaults = {"--experiment": "all"}
+    if not given("--root"):
+        # Synthetic data: small settings, so every experiment runs in minutes.
+        defaults.update(
+            {
+                "--folds": "2",
+                "--ablation-folds": "2",
+                "--epochs": "2",
+                "--monthly-epochs": "2",
+            }
+        )
+    for flag, value in defaults.items():
+        if not given(flag):
+            argv += [flag, value]
     pipeline.main(argv)

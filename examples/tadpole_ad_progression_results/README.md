@@ -72,12 +72,14 @@ the encoder-decoder with the smaller encoder.
 
 ## Running
 
-Synthetic data (no ADNI access needed; the pipeline runs end to end in about
-25 s on a CPU, and its numbers only show that it runs):
+Synthetic data, no ADNI access needed. `quick` runs one configuration of each
+model in about 25 s on a CPU; `my_replication.py` runs every experiment with
+small settings (78 runs, about 2 minutes). The numbers only show that the
+pipeline runs end to end:
 
 ```bash
 python examples/tadpole_ad_progression_prediction_visit_transformer.py --experiment quick
-python examples/my_replication.py            # same pipeline, every experiment, synthetic
+python examples/my_replication.py            # every experiment, 2 folds, 2 epochs (~2 min)
 ```
 
 Real data (`TADPOLE_D1_D2.csv` from the TADPOLE challenge, ADNI access
